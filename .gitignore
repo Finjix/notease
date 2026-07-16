@@ -1,0 +1,17 @@
+# Build outputs and generated runtime files
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+
+# Visual Studio / IDE files
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+
+# Local editor and OS metadata
+.idea/
+*.tmp
+Thumbs.db
+Desktop.ini

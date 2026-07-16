@@ -37,12 +37,13 @@ constexpr UINT kShowMessage = WM_APP + 2;
 constexpr UINT kSaveTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
+constexpr int kEditorControlId = 2001;
+constexpr int kCollapseButtonId = 2002;
+constexpr int kHideButtonId = 2003;
+
 constexpr UINT kTrayShowCommand = 1001;
 constexpr UINT kTrayAutoStartCommand = 1002;
 constexpr UINT kTrayExitCommand = 1003;
-constexpr int kControlNone = 0;
-constexpr int kControlCollapse = 1;
-constexpr int kControlHide = 2;
 
 constexpr int kNormalWidth = 380;
 constexpr int kNormalHeight = 280;
@@ -57,13 +58,14 @@ struct AppState {
     HINSTANCE instance = nullptr;
     HWND window = nullptr;
     HWND editor = nullptr;
+    HWND collapseButton = nullptr;
+    HWND hideButton = nullptr;
     HANDLE mutex = nullptr;
     HFONT editorFont = nullptr;
     NOTIFYICONDATAW tray{};
     UINT taskbarCreatedMessage = 0;
     bool trayAdded = false;
     bool collapsed = false;
-    int hoveredControl = kControlNone;
     int normalWidth = kNormalWidth;
     int normalHeight = kNormalHeight;
     Settings settings{};
@@ -141,17 +143,6 @@ std::filesystem::path ExecutableDirectory() {
 std::filesystem::path SettingsFilePath() {
     const std::filesystem::path directory = ExecutableDirectory();
     return directory.empty() ? std::filesystem::path{} : directory / L"setting.ini";
-}
-
-void DebugAutoStart(const wchar_t* step, LSTATUS status) {
-    const std::filesystem::path directory = ExecutableDirectory();
-    if (directory.empty()) {
-        return;
-    }
-    std::wofstream file(directory / L"autostart-debug.txt", std::ios::app);
-    if (file.is_open()) {
-        file << step << L"=" << status << L"\n";
-    }
 }
 
 std::filesystem::path NoteFilePath() {
@@ -336,7 +327,6 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
         HKEY key = nullptr;
         const LSTATUS openStatus = RegOpenKeyExW(
             HKEY_CURRENT_USER, kAutoStartSubKey, 0, KEY_SET_VALUE, &key);
-        DebugAutoStart(L"disable.open", openStatus);
         if (openStatus == ERROR_FILE_NOT_FOUND) {
             return true;
         }
@@ -346,7 +336,6 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
         }
 
         LSTATUS deleteStatus = RegDeleteValueW(key, kAutoStartValueName);
-        DebugAutoStart(L"disable.delete", deleteStatus);
         if (deleteStatus == ERROR_FILE_NOT_FOUND) {
             deleteStatus = ERROR_SUCCESS;
         }
@@ -368,7 +357,6 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
     const LSTATUS createStatus = RegCreateKeyExW(
         HKEY_CURRENT_USER, kAutoStartSubKey, 0, nullptr, REG_OPTION_NON_VOLATILE,
         KEY_SET_VALUE, nullptr, &key, &disposition);
-    DebugAutoStart(L"enable.create", createStatus);
     if (createStatus != ERROR_SUCCESS) {
         return fail(L"无法打开当前用户的自启动注册表项：" +
                     LastErrorText(createStatus));
@@ -379,7 +367,6 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
     const LSTATUS setStatus = RegSetValueExW(
         key, kAutoStartValueName, 0, REG_SZ,
         reinterpret_cast<const BYTE*>(command.c_str()), bytes);
-    DebugAutoStart(L"enable.set", setStatus);
     RegCloseKey(key);
     if (setStatus != ERROR_SUCCESS) {
         return fail(L"无法开启 Notease 自启动：" + LastErrorText(setStatus));
@@ -389,39 +376,6 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
 
 void ShowError(const std::wstring& message) {
     MessageBoxW(g_app.window, message.c_str(), L"Notease", MB_OK | MB_ICONWARNING);
-}
-
-RECT CollapseButtonRect(HWND window) {
-    RECT client{};
-    GetClientRect(window, &client);
-    const int height = ScaleForDpi(kTitleBarHeight, window);
-    const int width = ScaleForDpi(58, window);
-    const int gap = ScaleForDpi(6, window);
-    const int right = client.right - ScaleForDpi(10, window);
-    return {right - width - gap - width, ScaleForDpi(5, window),
-            right - gap, height - ScaleForDpi(5, window)};
-}
-
-RECT HideButtonRect(HWND window) {
-    RECT client{};
-    GetClientRect(window, &client);
-    const int height = ScaleForDpi(kTitleBarHeight, window);
-    const int width = ScaleForDpi(58, window);
-    const int right = client.right - ScaleForDpi(10, window);
-    return {right - width, ScaleForDpi(5, window), right,
-            height - ScaleForDpi(5, window)};
-}
-
-int ControlAtPoint(HWND window, POINT point) {
-    RECT rectangle = CollapseButtonRect(window);
-    if (PtInRect(&rectangle, point)) {
-        return kControlCollapse;
-    }
-    rectangle = HideButtonRect(window);
-    if (PtInRect(&rectangle, point)) {
-        return kControlHide;
-    }
-    return kControlNone;
 }
 
 void SetWindowRegion(HWND window) {
@@ -454,6 +408,31 @@ void LayoutEditor(HWND window) {
                client.bottom - top - padding, TRUE);
 }
 
+void LayoutButtons(HWND window) {
+    if (g_app.collapseButton == nullptr || g_app.hideButton == nullptr) {
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(window, &client);
+    const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
+    const int buttonHeight = titleHeight - ScaleForDpi(10, window);
+    const int buttonWidth = ScaleForDpi(58, window);
+    const int gap = ScaleForDpi(6, window);
+    const int right = client.right - ScaleForDpi(10, window);
+    const int top = ScaleForDpi(5, window);
+
+    MoveWindow(g_app.collapseButton, right - buttonWidth - gap - buttonWidth,
+               top, buttonWidth, buttonHeight, TRUE);
+    MoveWindow(g_app.hideButton, right - buttonWidth, top, buttonWidth,
+               buttonHeight, TRUE);
+}
+
+void LayoutControls(HWND window) {
+    LayoutEditor(window);
+    LayoutButtons(window);
+}
+
 void UpdateEditorFont(HWND window) {
     if (g_app.editor == nullptr) {
         return;
@@ -470,6 +449,14 @@ void UpdateEditorFont(HWND window) {
     HFONT previous = g_app.editorFont;
     g_app.editorFont = font;
     SendMessageW(g_app.editor, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    if (g_app.collapseButton != nullptr) {
+        SendMessageW(g_app.collapseButton, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(font), TRUE);
+    }
+    if (g_app.hideButton != nullptr) {
+        SendMessageW(g_app.hideButton, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(font), TRUE);
+    }
     if (previous != nullptr) {
         DeleteObject(previous);
     }
@@ -485,7 +472,9 @@ void ToggleCollapse(HWND window) {
     SetWindowPos(window, HWND_TOPMOST, rectangle.left, rectangle.top,
                  rectangle.right - rectangle.left, height,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    LayoutEditor(window);
+    SetWindowTextW(g_app.collapseButton,
+                   g_app.collapsed ? L"展开" : L"收起");
+    LayoutControls(window);
     InvalidateRect(window, nullptr, FALSE);
 }
 
@@ -497,7 +486,8 @@ void ShowNoteWindow(HWND window) {
         SetWindowPos(window, HWND_TOPMOST, rectangle.left, rectangle.top,
                      rectangle.right - rectangle.left, g_app.normalHeight,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        LayoutEditor(window);
+        SetWindowTextW(g_app.collapseButton, L"收起");
+        LayoutControls(window);
         InvalidateRect(window, nullptr, FALSE);
     }
 
@@ -513,7 +503,6 @@ void ShowNoteWindow(HWND window) {
 void HideNoteWindow(HWND window) {
     SaveNoteText(g_app.editor);
     ShowWindow(window, SW_HIDE);
-    g_app.hoveredControl = kControlNone;
 }
 
 bool AddTrayIcon(HWND window) {
@@ -565,6 +554,22 @@ void ToggleAutoStart() {
     g_app.settings = next;
 }
 
+void HandleTrayCommand(HWND window, UINT command) {
+    switch (command) {
+    case kTrayShowCommand:
+        ShowNoteWindow(window);
+        break;
+    case kTrayAutoStartCommand:
+        ToggleAutoStart();
+        break;
+    case kTrayExitCommand:
+        PostMessageW(window, WM_CLOSE, 0, 0);
+        break;
+    default:
+        break;
+    }
+}
+
 void ShowTrayMenu(HWND window) {
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
@@ -582,16 +587,21 @@ void ShowTrayMenu(HWND window) {
     POINT cursor{};
     GetCursorPos(&cursor);
     SetForegroundWindow(window);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                   cursor.x, cursor.y, 0, window, nullptr);
+    const UINT command = TrackPopupMenu(
+        menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN |
+                  TPM_RETURNCMD | TPM_NONOTIFY,
+        cursor.x, cursor.y, 0, window, nullptr);
     PostMessageW(window, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    HandleTrayCommand(window, command);
 }
 
-void PaintButton(HDC deviceContext, HWND window, const RECT& rectangle,
-                 const std::wstring& text, int control) {
-    const bool hovered = g_app.hoveredControl == control;
-    const COLORREF background = hovered ? RGB(255, 238, 166) : RGB(250, 225, 125);
+void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text) {
+    HDC deviceContext = item.hDC;
+    RECT rectangle = item.rcItem;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const COLORREF background = pressed ? RGB(238, 204, 104)
+                                        : RGB(250, 225, 125);
     HBRUSH brush = CreateSolidBrush(background);
     FillRect(deviceContext, &rectangle, brush);
     DeleteObject(brush);
@@ -606,13 +616,16 @@ void PaintButton(HDC deviceContext, HWND window, const RECT& rectangle,
     DeleteObject(pen);
 
     HFONT font = CreateFontW(
-        -ScaleForDpi(12, window), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -ScaleForDpi(12, g_app.window), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(deviceContext, font);
     SetBkMode(deviceContext, TRANSPARENT);
     SetTextColor(deviceContext, RGB(86, 67, 20));
     RECT textRectangle = rectangle;
+    if (pressed) {
+        OffsetRect(&textRectangle, 1, 1);
+    }
     DrawTextW(deviceContext, text.c_str(), -1, &textRectangle,
               DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     SelectObject(deviceContext, oldFont);
@@ -647,11 +660,6 @@ void PaintWindow(HWND window, HDC deviceContext) {
     SelectObject(deviceContext, oldFont);
     DeleteObject(titleFont);
 
-    PaintButton(deviceContext, window, CollapseButtonRect(window),
-                g_app.collapsed ? L"展开" : L"收起", kControlCollapse);
-    PaintButton(deviceContext, window, HideButtonRect(window), L"隐藏",
-                kControlHide);
-
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(211, 180, 65));
     HGDIOBJ oldPen = SelectObject(deviceContext, borderPen);
     HGDIOBJ oldBrush = SelectObject(deviceContext, GetStockObject(NULL_BRUSH));
@@ -673,13 +681,38 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
     case WM_CREATE: {
         g_app.normalWidth = ScaleForDpi(kNormalWidth, window);
         g_app.normalHeight = ScaleForDpi(kNormalHeight, window);
+        RECT initialWindow{};
+        if (GetWindowRect(window, &initialWindow) &&
+            initialWindow.bottom > initialWindow.top &&
+            initialWindow.right > initialWindow.left) {
+            g_app.normalWidth = initialWindow.right - initialWindow.left;
+            g_app.normalHeight = initialWindow.bottom - initialWindow.top;
+        }
         g_app.editor = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
                 ES_WANTRETURN | WS_VSCROLL,
-            0, 0, 0, 0, window, reinterpret_cast<HMENU>(1001), g_app.instance,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditorControlId)),
+            g_app.instance,
             nullptr);
         if (g_app.editor == nullptr) {
+            return -1;
+        }
+
+        g_app.collapseButton = CreateWindowExW(
+            0, L"BUTTON", L"收起",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCollapseButtonId)),
+            g_app.instance, nullptr);
+        g_app.hideButton = CreateWindowExW(
+            0, L"BUTTON", L"隐藏",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHideButtonId)),
+            g_app.instance, nullptr);
+        if (g_app.collapseButton == nullptr || g_app.hideButton == nullptr) {
             return -1;
         }
 
@@ -688,19 +721,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                      MAKELONG(8, 8));
         UpdateEditorFont(window);
         SetWindowTextW(g_app.editor, LoadNoteText().c_str());
-        LayoutEditor(window);
+        LayoutControls(window);
         SetWindowRegion(window);
         return 0;
     }
 
     case WM_SIZE:
         SetWindowRegion(window);
-        LayoutEditor(window);
+        LayoutControls(window);
         return 0;
 
     case WM_DPICHANGED:
         UpdateEditorFont(window);
-        LayoutEditor(window);
+        LayoutControls(window);
         SetWindowRegion(window);
         return 0;
 
@@ -709,40 +742,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         ScreenToClient(window, &point);
         const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
         if (point.y < titleHeight) {
-            return ControlAtPoint(window, point) == kControlNone ? HTCAPTION : HTCLIENT;
+            HWND child = ChildWindowFromPointEx(window, point,
+                                                CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+            if (child == g_app.collapseButton || child == g_app.hideButton) {
+                return HTCLIENT;
+            }
+            return HTCAPTION;
         }
         return HTCLIENT;
-    }
-
-    case WM_MOUSEMOVE: {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const int control = ControlAtPoint(window, point);
-        if (control != g_app.hoveredControl) {
-            g_app.hoveredControl = control;
-            InvalidateRect(window, nullptr, FALSE);
-        }
-        TRACKMOUSEEVENT tracking{};
-        tracking.cbSize = sizeof(tracking);
-        tracking.dwFlags = TME_LEAVE;
-        tracking.hwndTrack = window;
-        TrackMouseEvent(&tracking);
-        return 0;
-    }
-
-    case WM_MOUSELEAVE:
-        g_app.hoveredControl = kControlNone;
-        InvalidateRect(window, nullptr, FALSE);
-        return 0;
-
-    case WM_LBUTTONUP: {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const int control = ControlAtPoint(window, point);
-        if (control == kControlCollapse) {
-            ToggleCollapse(window);
-        } else if (control == kControlHide) {
-            HideNoteWindow(window);
-        }
-        return 0;
     }
 
     case WM_COMMAND:
@@ -751,16 +758,23 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             SetTimer(window, kSaveTimer, 500, nullptr);
             return 0;
         }
+        if (HIWORD(wParam) == BN_CLICKED &&
+            reinterpret_cast<HWND>(lParam) == g_app.collapseButton) {
+            ToggleCollapse(window);
+            return 0;
+        }
+        if (HIWORD(wParam) == BN_CLICKED &&
+            reinterpret_cast<HWND>(lParam) == g_app.hideButton) {
+            HideNoteWindow(window);
+            return 0;
+        }
         if (LOWORD(wParam) == kTrayShowCommand) {
-            ShowNoteWindow(window);
+            HandleTrayCommand(window, LOWORD(wParam));
             return 0;
         }
-        if (LOWORD(wParam) == kTrayAutoStartCommand) {
-            ToggleAutoStart();
-            return 0;
-        }
-        if (LOWORD(wParam) == kTrayExitCommand) {
-            PostMessageW(window, WM_CLOSE, 0, 0);
+        if (LOWORD(wParam) == kTrayAutoStartCommand ||
+            LOWORD(wParam) == kTrayExitCommand) {
+            HandleTrayCommand(window, LOWORD(wParam));
             return 0;
         }
         break;
@@ -781,13 +795,30 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         return reinterpret_cast<LRESULT>(editBrush);
     }
 
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (item == nullptr || item->CtlType != ODT_BUTTON) {
+            break;
+        }
+        if (item->CtlID == kCollapseButtonId) {
+            PaintButton(*item, g_app.collapsed ? L"展开" : L"收起");
+            return TRUE;
+        }
+        if (item->CtlID == kHideButtonId) {
+            PaintButton(*item, L"隐藏");
+            return TRUE;
+        }
+        break;
+    }
+
     case kTrayMessage:
-        switch (static_cast<UINT>(lParam)) {
+        switch (LOWORD(lParam)) {
         case WM_LBUTTONUP:
         case WM_LBUTTONDBLCLK:
             ShowNoteWindow(window);
             return 0;
         case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
             ShowTrayMenu(window);
             return 0;
         default:
