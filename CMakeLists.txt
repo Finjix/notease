@@ -4,6 +4,7 @@ project(Notease LANGUAGES CXX)
 
 add_executable(Notease WIN32
     src/main.cpp
+    src/resource.rc
 )
 
 target_compile_features(Notease PRIVATE cxx_std_17)
@@ -20,6 +21,7 @@ target_link_libraries(Notease PRIVATE
     gdi32
     shell32
     user32
+    gdiplus
 )
 
 if(MSVC)

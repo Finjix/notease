@@ -13,10 +13,14 @@
 #define _WIN32_WINNT 0x0A00
 
 #include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -31,9 +35,11 @@ constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\Notease.SingleInstance";
 constexpr wchar_t kAutoStartSubKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kAutoStartValueName[] = L"Notease";
+constexpr int kApplicationIconId = 101;
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kShowMessage = WM_APP + 2;
+constexpr UINT kToggleAlwaysOnTopMessage = WM_APP + 3;
 constexpr UINT kSaveTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -41,25 +47,29 @@ constexpr int kEditorControlId = 2001;
 constexpr int kCollapseButtonId = 2002;
 constexpr int kHideButtonId = 2003;
 
-constexpr UINT kTrayShowCommand = 1001;
 constexpr UINT kTrayAutoStartCommand = 1002;
 constexpr UINT kTrayExitCommand = 1003;
 
 constexpr int kNormalWidth = 380;
 constexpr int kNormalHeight = 280;
-constexpr int kCollapsedHeight = 44;
-constexpr int kTitleBarHeight = 44;
+constexpr int kCollapsedHeight = 32;
+constexpr int kTitleBarHeight = 32;
+constexpr int kTitleHoverWidth = 88;
 
 struct Settings {
     bool autoStart = true;
+    bool alwaysOnTop = false;
 };
 
 struct AppState {
     HINSTANCE instance = nullptr;
     HWND window = nullptr;
     HWND editor = nullptr;
+    WNDPROC editorWindowProc = nullptr;
     HWND collapseButton = nullptr;
     HWND hideButton = nullptr;
+    WNDPROC collapseButtonWindowProc = nullptr;
+    WNDPROC hideButtonWindowProc = nullptr;
     HANDLE mutex = nullptr;
     HFONT editorFont = nullptr;
     NOTIFYICONDATAW tray{};
@@ -72,6 +82,75 @@ struct AppState {
 };
 
 AppState g_app;
+ULONG_PTR g_gdiplusToken = 0;
+
+LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wParam,
+                                  LPARAM lParam) {
+    if (message == WM_MOUSEWHEEL) {
+        const int wheelSteps = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        if (wheelSteps != 0) {
+            UINT linesPerScroll = 3;
+            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,
+                                  sizeof(linesPerScroll), &linesPerScroll, 0);
+            if (linesPerScroll == WHEEL_PAGESCROLL) {
+                RECT client{};
+                GetClientRect(window, &client);
+                linesPerScroll = static_cast<UINT>(std::max(1L, client.bottom / 20));
+            }
+            SendMessageW(window, EM_LINESCROLL, 0,
+                         -wheelSteps * static_cast<int>(linesPerScroll));
+        }
+        return 0;
+    }
+
+    return CallWindowProcW(g_app.editorWindowProc, window, message, wParam,
+                           lParam);
+}
+
+WNDPROC OriginalButtonWindowProc(HWND window) {
+    if (window == g_app.collapseButton) {
+        return g_app.collapseButtonWindowProc;
+    }
+    if (window == g_app.hideButton) {
+        return g_app.hideButtonWindowProc;
+    }
+    return nullptr;
+}
+
+LRESULT CALLBACK ButtonWindowProc(HWND window, UINT message, WPARAM wParam,
+                                 LPARAM lParam) {
+    if (message == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return TRUE;
+    }
+    if (message == WM_ERASEBKGND || message == WM_MOUSEMOVE) {
+        return 0;
+    }
+    if (message == WM_LBUTTONDOWN) {
+        SetCapture(window);
+        return 0;
+    }
+    if (message == WM_LBUTTONUP) {
+        if (GetCapture() == window) {
+            ReleaseCapture();
+            const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            RECT client{};
+            GetClientRect(window, &client);
+            if (PtInRect(&client, point) != FALSE) {
+                HWND parent = GetParent(window);
+                SendMessageW(parent, WM_COMMAND,
+                             MAKEWPARAM(GetDlgCtrlID(window), BN_CLICKED),
+                             reinterpret_cast<LPARAM>(window));
+            }
+        }
+        return 0;
+    }
+
+    WNDPROC original = OriginalButtonWindowProc(window);
+    return original == nullptr
+               ? DefWindowProcW(window, message, wParam, lParam)
+               : CallWindowProcW(original, window, message, wParam, lParam);
+}
 
 int ScaleForDpi(int value, HWND window) {
     const UINT dpi = window == nullptr ? 96 : GetDpiForWindow(window);
@@ -116,22 +195,6 @@ std::wstring CurrentExecutablePath() {
     }
 }
 
-std::wstring EnvironmentVariable(const wchar_t* name) {
-    DWORD length = GetEnvironmentVariableW(name, nullptr, 0);
-    if (length == 0) {
-        return {};
-    }
-
-    std::vector<wchar_t> buffer(length + 1);
-    length = GetEnvironmentVariableW(name, buffer.data(),
-                                     static_cast<DWORD>(buffer.size()));
-    if (length == 0) {
-        return {};
-    }
-    buffer.resize(length);
-    return std::wstring(buffer.begin(), buffer.end());
-}
-
 std::filesystem::path ExecutableDirectory() {
     const std::wstring executablePath = CurrentExecutablePath();
     if (executablePath.empty()) {
@@ -140,19 +203,9 @@ std::filesystem::path ExecutableDirectory() {
     return std::filesystem::path(executablePath).parent_path();
 }
 
-std::filesystem::path SettingsFilePath() {
+std::filesystem::path NoteaseFilePath() {
     const std::filesystem::path directory = ExecutableDirectory();
-    return directory.empty() ? std::filesystem::path{} : directory / L"setting.ini";
-}
-
-std::filesystem::path NoteFilePath() {
-    const std::wstring localAppData = EnvironmentVariable(L"LOCALAPPDATA");
-    if (!localAppData.empty()) {
-        return std::filesystem::path(localAppData) / L"Notease" / L"note.txt";
-    }
-
-    const std::filesystem::path directory = ExecutableDirectory();
-    return directory.empty() ? std::filesystem::path{} : directory / L"note.txt";
+    return directory.empty() ? std::filesystem::path{} : directory / L"notease.json";
 }
 
 bool EnsureParentDirectory(const std::filesystem::path& path) {
@@ -211,108 +264,163 @@ std::string WideToUtf8(const std::wstring& value) {
     return result;
 }
 
-std::wstring LoadNoteText() {
-    const std::filesystem::path path = NoteFilePath();
+std::string JsonEscape(const std::string& value) {
+    std::string result;
+    result.reserve(value.size() + 16);
+    const char* hex = "0123456789abcdef";
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '"': result += "\\\""; break;
+        case '\\': result += "\\\\"; break;
+        case '\b': result += "\\b"; break;
+        case '\f': result += "\\f"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (character < 0x20) {
+                result += "\\u00";
+                result += hex[character >> 4];
+                result += hex[character & 0x0f];
+            } else {
+                result += static_cast<char>(character);
+            }
+        }
+    }
+    return result;
+}
+
+bool ParseJsonStringField(const std::string& json, const std::string& key,
+                          std::string& value) {
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPosition = json.find(marker);
+    if (keyPosition == std::string::npos) return false;
+    size_t position = json.find(':', keyPosition + marker.size());
+    if (position == std::string::npos) return false;
+    ++position;
+    while (position < json.size() && isspace(static_cast<unsigned char>(json[position]))) ++position;
+    if (position >= json.size() || json[position] != '"') return false;
+    ++position;
+    value.clear();
+    while (position < json.size()) {
+        const unsigned char character = static_cast<unsigned char>(json[position++]);
+        if (character == '"') return true;
+        if (character != '\\' || position >= json.size()) return false;
+        const char escaped = json[position++];
+        switch (escaped) {
+        case '"': value += '"'; break;
+        case '\\': value += '\\'; break;
+        case 'b': value += '\b'; break;
+        case 'f': value += '\f'; break;
+        case 'n': value += '\n'; break;
+        case 'r': value += '\r'; break;
+        case 't': value += '\t'; break;
+        default: return false;
+        }
+    }
+    return false;
+}
+
+bool ParseJsonBoolField(const std::string& json, const std::string& key, bool& value) {
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPosition = json.find(marker);
+    if (keyPosition == std::string::npos) return false;
+    size_t position = json.find(':', keyPosition + marker.size());
+    if (position == std::string::npos) return false;
+    ++position;
+    while (position < json.size() && isspace(static_cast<unsigned char>(json[position]))) ++position;
+    if (json.compare(position, 4, "true") == 0) { value = true; return true; }
+    if (json.compare(position, 5, "false") == 0) { value = false; return true; }
+    return false;
+}
+
+bool ReadUtf8File(const std::filesystem::path& path, std::string& content) {
     if (path.empty()) {
-        return {};
+        return false;
     }
-
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        return {};
-    }
-
-    std::string content((std::istreambuf_iterator<char>(file)),
-                        std::istreambuf_iterator<char>());
+    if (!file.is_open()) return false;
+    content.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (content.size() >= 3 &&
         static_cast<unsigned char>(content[0]) == 0xEF &&
         static_cast<unsigned char>(content[1]) == 0xBB &&
         static_cast<unsigned char>(content[2]) == 0xBF) {
         content.erase(0, 3);
     }
-    return Utf8ToWide(content);
+    return true;
+}
+
+std::wstring LoadNoteText() {
+    std::string json;
+    std::string note;
+    if (ReadUtf8File(NoteaseFilePath(), json) && ParseJsonStringField(json, "note", note)) {
+        return Utf8ToWide(note);
+    }
+    return {};
+}
+
+bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
+                     std::wstring* errorMessage = nullptr) {
+    const std::filesystem::path path = NoteaseFilePath();
+    if (path.empty() || !EnsureParentDirectory(path)) {
+        if (errorMessage != nullptr) *errorMessage = L"无法定位或创建 exe 所在目录。";
+        return false;
+    }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        if (errorMessage != nullptr) *errorMessage = L"无法写入 " + path.wstring() + L"。";
+        return false;
+    }
+    const std::string utf8 = WideToUtf8(note);
+    file << "{\n  \"note\": \"" << JsonEscape(utf8)
+         << "\",\n  \"autostart\": " << (settings.autoStart ? "true" : "false")
+         << ",\n  \"alwaysOnTop\": "
+         << (settings.alwaysOnTop ? "true" : "false") << "\n}\n";
+    return static_cast<bool>(file);
+}
+
+bool LoadSettings(Settings& settings) {
+    settings = Settings{};
+    std::string json;
+    bool autoStart = settings.autoStart;
+    if (ReadUtf8File(NoteaseFilePath(), json) && ParseJsonBoolField(json, "autostart", autoStart)) {
+        settings.autoStart = autoStart;
+    }
+    bool alwaysOnTop = settings.alwaysOnTop;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonBoolField(json, "alwaysOnTop", alwaysOnTop)) {
+        settings.alwaysOnTop = alwaysOnTop;
+    }
+    return !json.empty();
+}
+
+bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr) {
+    return SaveNoteaseFile(LoadNoteText(), settings, errorMessage);
 }
 
 bool SaveNoteText(HWND editor) {
-    if (editor == nullptr) {
-        return false;
-    }
+    if (editor == nullptr) return false;
 
     const int length = GetWindowTextLengthW(editor);
     std::wstring content(length + 1, L'\0');
     GetWindowTextW(editor, content.data(), length + 1);
     content.resize(length);
 
-    const std::filesystem::path path = NoteFilePath();
-    if (path.empty() || !EnsureParentDirectory(path)) {
-        return false;
-    }
-
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    const std::string utf8 = WideToUtf8(content);
-    file.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
-    return static_cast<bool>(file);
+    Settings settings;
+    LoadSettings(settings);
+    return SaveNoteaseFile(content, settings);
 }
 
-bool LoadSettings(Settings& settings) {
-    settings = Settings{};
-    const std::filesystem::path path = SettingsFilePath();
-    if (path.empty()) {
-        return false;
-    }
-
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line == "autostart=0") {
-            settings.autoStart = false;
-        } else if (line == "autostart=1") {
-            settings.autoStart = true;
-        }
-    }
-    return true;
+void ApplyAlwaysOnTop(HWND window, bool alwaysOnTop) {
+    SetWindowPos(window, alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0,
+                 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr) {
-    const std::filesystem::path path = SettingsFilePath();
-    if (path.empty()) {
-        if (errorMessage != nullptr) {
-            *errorMessage = L"无法定位当前 exe 所在目录。";
-        }
-        return false;
+void RedrawButton(HWND button) {
+    if (button != nullptr) {
+        RedrawWindow(button, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_NOERASE);
     }
-
-    if (!EnsureParentDirectory(path)) {
-        if (errorMessage != nullptr) {
-            *errorMessage = L"无法创建配置文件目录。";
-        }
-        return false;
-    }
-
-    std::ofstream file(path, std::ios::out | std::ios::trunc);
-    if (!file.is_open()) {
-        if (errorMessage != nullptr) {
-            *errorMessage = L"无法写入 " + path.wstring() + L"。";
-        }
-        return false;
-    }
-
-    file << "autostart=" << (settings.autoStart ? "1" : "0") << "\n";
-    if (!file && errorMessage != nullptr) {
-        *errorMessage = L"写入配置文件时发生错误。";
-    }
-    return static_cast<bool>(file);
 }
 
 bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
@@ -402,10 +510,18 @@ void LayoutEditor(HWND window) {
 
     RECT client{};
     GetClientRect(window, &client);
-    const int padding = ScaleForDpi(12, window);
+    const int padding = ScaleForDpi(3, window);
     const int top = ScaleForDpi(kTitleBarHeight, window) + padding;
     MoveWindow(g_app.editor, padding, top, client.right - padding * 2,
                client.bottom - top - padding, TRUE);
+
+    RECT editorClient{};
+    GetClientRect(g_app.editor, &editorClient);
+    const int textMargin = ScaleForDpi(8, window);
+    RECT textRectangle{textMargin, 0, editorClient.right - textMargin,
+                       editorClient.bottom};
+    SendMessageW(g_app.editor, EM_SETRECTNP, 0,
+                 reinterpret_cast<LPARAM>(&textRectangle));
 }
 
 void LayoutButtons(HWND window) {
@@ -416,11 +532,11 @@ void LayoutButtons(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
     const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
-    const int buttonHeight = titleHeight - ScaleForDpi(10, window);
-    const int buttonWidth = ScaleForDpi(58, window);
-    const int gap = ScaleForDpi(6, window);
-    const int right = client.right - ScaleForDpi(10, window);
-    const int top = ScaleForDpi(5, window);
+    const int buttonHeight = titleHeight - ScaleForDpi(8, window);
+    const int buttonWidth = ScaleForDpi(34, window);
+    const int gap = ScaleForDpi(4, window);
+    const int right = client.right - ScaleForDpi(8, window);
+    const int top = ScaleForDpi(4, window);
 
     MoveWindow(g_app.collapseButton, right - buttonWidth - gap - buttonWidth,
                top, buttonWidth, buttonHeight, TRUE);
@@ -462,37 +578,23 @@ void UpdateEditorFont(HWND window) {
     }
 }
 
-void ToggleCollapse(HWND window) {
-    RECT rectangle{};
-    GetWindowRect(window, &rectangle);
-    g_app.collapsed = !g_app.collapsed;
-    const int height = g_app.collapsed
-                           ? ScaleForDpi(kCollapsedHeight, window)
-                           : g_app.normalHeight;
-    SetWindowPos(window, HWND_TOPMOST, rectangle.left, rectangle.top,
-                 rectangle.right - rectangle.left, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetWindowTextW(g_app.collapseButton,
-                   g_app.collapsed ? L"展开" : L"收起");
-    LayoutControls(window);
-    InvalidateRect(window, nullptr, FALSE);
-}
-
 void ShowNoteWindow(HWND window) {
     if (g_app.collapsed) {
         g_app.collapsed = false;
         RECT rectangle{};
         GetWindowRect(window, &rectangle);
-        SetWindowPos(window, HWND_TOPMOST, rectangle.left, rectangle.top,
+        SetWindowPos(window, g_app.settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     rectangle.left, rectangle.top,
                      rectangle.right - rectangle.left, g_app.normalHeight,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        SetWindowTextW(g_app.collapseButton, L"收起");
+        SetWindowTextW(g_app.collapseButton, L"");
         LayoutControls(window);
         InvalidateRect(window, nullptr, FALSE);
     }
 
     ShowWindow(window, SW_SHOWNORMAL);
-    SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+    SetWindowPos(window, g_app.settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(window);
     if (g_app.editor != nullptr) {
@@ -516,7 +618,8 @@ bool AddTrayIcon(HWND window) {
     g_app.tray.uID = kTrayIconId;
     g_app.tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_app.tray.uCallbackMessage = kTrayMessage;
-    g_app.tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    g_app.tray.hIcon = LoadIconW(
+        g_app.instance, MAKEINTRESOURCEW(kApplicationIconId));
     lstrcpynW(g_app.tray.szTip, L"Notease 便签", ARRAYSIZE(g_app.tray.szTip));
 
     g_app.trayAdded = Shell_NotifyIconW(NIM_ADD, &g_app.tray) == TRUE;
@@ -554,11 +657,23 @@ void ToggleAutoStart() {
     g_app.settings = next;
 }
 
+void ToggleAlwaysOnTop(HWND window) {
+    const bool previous = g_app.settings.alwaysOnTop;
+    Settings next = g_app.settings;
+    next.alwaysOnTop = !previous;
+    std::wstring error;
+    if (!SaveSettings(next, &error)) {
+        ShowError(error);
+        return;
+    }
+
+    g_app.settings = next;
+    ApplyAlwaysOnTop(window, next.alwaysOnTop);
+    RedrawButton(g_app.collapseButton);
+}
+
 void HandleTrayCommand(HWND window, UINT command) {
     switch (command) {
-    case kTrayShowCommand:
-        ShowNoteWindow(window);
-        break;
     case kTrayAutoStartCommand:
         ToggleAutoStart();
         break;
@@ -576,11 +691,9 @@ void ShowTrayMenu(HWND window) {
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, kTrayShowCommand, L"显示便签");
     const std::wstring autoStartText =
-        g_app.settings.autoStart ? L"自启动 √" : L"自启动 ×";
-    AppendMenuW(menu, MF_STRING | (g_app.settings.autoStart ? MF_CHECKED : 0),
-                kTrayAutoStartCommand, autoStartText.c_str());
+        g_app.settings.autoStart ? L"自启动√" : L"自启动×";
+    AppendMenuW(menu, MF_STRING, kTrayAutoStartCommand, autoStartText.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kTrayExitCommand, L"退出程序");
 
@@ -596,38 +709,71 @@ void ShowTrayMenu(HWND window) {
     HandleTrayCommand(window, command);
 }
 
-void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text) {
+void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
+                 bool emphasized) {
     HDC deviceContext = item.hDC;
     RECT rectangle = item.rcItem;
-    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const COLORREF background = pressed ? RGB(238, 204, 104)
-                                        : RGB(250, 225, 125);
+    const COLORREF background = RGB(248, 222, 116);
     HBRUSH brush = CreateSolidBrush(background);
     FillRect(deviceContext, &rectangle, brush);
     DeleteObject(brush);
 
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(218, 190, 82));
-    HGDIOBJ oldPen = SelectObject(deviceContext, pen);
-    HGDIOBJ oldBrush = SelectObject(deviceContext, GetStockObject(NULL_BRUSH));
-    Rectangle(deviceContext, rectangle.left, rectangle.top, rectangle.right,
-              rectangle.bottom);
-    SelectObject(deviceContext, oldBrush);
-    SelectObject(deviceContext, oldPen);
-    DeleteObject(pen);
-
+    const bool pinIcon = item.CtlID == kCollapseButtonId;
     HFONT font = CreateFontW(
-        -ScaleForDpi(12, g_app.window), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -ScaleForDpi(pinIcon ? 16 : 12, g_app.window), 0, 0, 0,
+        pinIcon ? FW_BOLD : (emphasized ? FW_SEMIBOLD : FW_NORMAL),
+        FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        item.CtlID == kCollapseButtonId ? L"Segoe MDL2 Assets"
+                                        : L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(deviceContext, font);
     SetBkMode(deviceContext, TRANSPARENT);
     SetTextColor(deviceContext, RGB(86, 67, 20));
     RECT textRectangle = rectangle;
-    if (pressed) {
-        OffsetRect(&textRectangle, 1, 1);
+    if (pinIcon) {
+        const int centerX = (textRectangle.left + textRectangle.right) / 2;
+        const int centerY = (textRectangle.top + textRectangle.bottom) / 2;
+        constexpr double diagonalAngle = 0.7853981633974483;
+        const double angle = g_app.settings.alwaysOnTop ? 0.0 : diagonalAngle;
+        const double sine = std::sin(angle);
+        const double cosine = std::cos(angle);
+        const double scale =
+            static_cast<double>(ScaleForDpi(1, g_app.window)) * 0.58;
+        const POINT shape[] = {
+            {-6, -8}, {6, -8}, {6, -5}, {4, -5}, {4, -1}, {7, 1},
+            {7, 3}, {2, 3}, {2, 7}, {0, 11}, {-2, 7}, {-2, 3},
+            {-7, 3}, {-7, 1}, {-4, -1}, {-4, -5}, {-6, -5},
+        };
+        Gdiplus::PointF pinShape[ARRAYSIZE(shape)]{};
+        for (size_t index = 0; index < ARRAYSIZE(shape); ++index) {
+            const double x = static_cast<double>(shape[index].x) * scale;
+            const double y = static_cast<double>(shape[index].y) * scale;
+            pinShape[index].X = static_cast<Gdiplus::REAL>(
+                centerX + x * cosine - y * sine);
+            pinShape[index].Y = static_cast<Gdiplus::REAL>(
+                centerY + x * sine + y * cosine);
+        }
+        Gdiplus::Graphics graphics(deviceContext);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::SolidBrush pinBrush(Gdiplus::Color(255, 86, 67, 20));
+        graphics.FillPolygon(&pinBrush, pinShape, ARRAYSIZE(pinShape));
+    } else if (emphasized) {
+        const int lineWidth = ScaleForDpi(14, g_app.window);
+        const int lineHeight = ScaleForDpi(2, g_app.window);
+        const int centerX = (textRectangle.left + textRectangle.right) / 2;
+        const int centerY = (textRectangle.top + textRectangle.bottom) / 2;
+        RECT lineRectangle{centerX - lineWidth / 2, centerY - lineHeight / 2,
+                           centerX + lineWidth / 2,
+                           centerY + (lineHeight + 1) / 2};
+        HBRUSH lineBrush = CreateSolidBrush(RGB(86, 67, 20));
+        FillRect(deviceContext, &lineRectangle, lineBrush);
+        DeleteObject(lineBrush);
+    } else {
+        DrawTextW(deviceContext, text.c_str(), -1, &textRectangle,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
-    DrawTextW(deviceContext, text.c_str(), -1, &textRectangle,
-              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     SelectObject(deviceContext, oldFont);
     DeleteObject(font);
 }
@@ -647,13 +793,14 @@ void PaintWindow(HWND window, HDC deviceContext) {
     DeleteObject(titleBrush);
 
     HFONT titleFont = CreateFontW(
-        -ScaleForDpi(15, window), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        -ScaleForDpi(14, window), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(deviceContext, titleFont);
+
     SetBkMode(deviceContext, TRANSPARENT);
     SetTextColor(deviceContext, RGB(77, 59, 16));
-    RECT titleText{ScaleForDpi(12, window), 0, titleRectangle.right,
+    RECT titleText{ScaleForDpi(10, window), 0, titleRectangle.right,
                    titleRectangle.bottom};
     DrawTextW(deviceContext, L"Notease", -1, &titleText,
               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -689,9 +836,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             g_app.normalHeight = initialWindow.bottom - initialWindow.top;
         }
         g_app.editor = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            0, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
-                ES_WANTRETURN | WS_VSCROLL,
+                ES_WANTRETURN,
             0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditorControlId)),
             g_app.instance,
@@ -699,15 +846,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         if (g_app.editor == nullptr) {
             return -1;
         }
+        g_app.editorWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_app.editor, GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(EditorWindowProc)));
 
         g_app.collapseButton = CreateWindowExW(
-            0, L"BUTTON", L"收起",
+            0, L"BUTTON", L"\xE841",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCollapseButtonId)),
             g_app.instance, nullptr);
         g_app.hideButton = CreateWindowExW(
-            0, L"BUTTON", L"隐藏",
+            0, L"BUTTON", L"一",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 0, 0, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHideButtonId)),
@@ -715,10 +865,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         if (g_app.collapseButton == nullptr || g_app.hideButton == nullptr) {
             return -1;
         }
-
+        g_app.collapseButtonWindowProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(g_app.collapseButton, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
+        g_app.hideButtonWindowProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(g_app.hideButton, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
         SendMessageW(g_app.editor, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
-        SendMessageW(g_app.editor, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                     MAKELONG(8, 8));
         UpdateEditorFont(window);
         SetWindowTextW(g_app.editor, LoadNoteText().c_str());
         LayoutControls(window);
@@ -742,6 +895,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         ScreenToClient(window, &point);
         const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
         if (point.y < titleHeight) {
+            if (point.x >= ScaleForDpi(10, window) &&
+                point.x < ScaleForDpi(kTitleHoverWidth, window)) {
+                return HTCLIENT;
+            }
             HWND child = ChildWindowFromPointEx(window, point,
                                                 CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
             if (child == g_app.collapseButton || child == g_app.hideButton) {
@@ -752,6 +909,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         return HTCLIENT;
     }
 
+    case WM_LBUTTONUP: {
+        const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
+        const int titleClickWidth = ScaleForDpi(kTitleHoverWidth, window);
+        if (GET_Y_LPARAM(lParam) < titleHeight &&
+            GET_X_LPARAM(lParam) >= ScaleForDpi(10, window) &&
+            GET_X_LPARAM(lParam) < titleClickWidth) {
+            SetWindowTextW(g_app.editor, L"");
+            SaveNoteText(g_app.editor);
+            SetFocus(g_app.editor);
+            return 0;
+        }
+        break;
+    }
+
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lParam) == g_app.editor &&
             HIWORD(wParam) == EN_CHANGE) {
@@ -760,16 +931,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         }
         if (HIWORD(wParam) == BN_CLICKED &&
             reinterpret_cast<HWND>(lParam) == g_app.collapseButton) {
-            ToggleCollapse(window);
+            PostMessageW(window, kToggleAlwaysOnTopMessage, 0, 0);
             return 0;
         }
         if (HIWORD(wParam) == BN_CLICKED &&
             reinterpret_cast<HWND>(lParam) == g_app.hideButton) {
             HideNoteWindow(window);
-            return 0;
-        }
-        if (LOWORD(wParam) == kTrayShowCommand) {
-            HandleTrayCommand(window, LOWORD(wParam));
             return 0;
         }
         if (LOWORD(wParam) == kTrayAutoStartCommand ||
@@ -778,6 +945,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             return 0;
         }
         break;
+
+    case WM_SETCURSOR: {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(window, &cursor);
+        if (cursor.x >= ScaleForDpi(10, window) &&
+            cursor.x < ScaleForDpi(kTitleHoverWidth, window) &&
+            cursor.y >= 0 && cursor.y < ScaleForDpi(kTitleBarHeight, window)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_TIMER:
         if (wParam == kSaveTimer) {
@@ -801,11 +981,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             break;
         }
         if (item->CtlID == kCollapseButtonId) {
-            PaintButton(*item, g_app.collapsed ? L"展开" : L"收起");
+            PaintButton(*item, L"\xE841", false);
             return TRUE;
         }
         if (item->CtlID == kHideButtonId) {
-            PaintButton(*item, L"隐藏");
+            PaintButton(*item, L"一", true);
             return TRUE;
         }
         break;
@@ -827,6 +1007,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
     case kShowMessage:
         ShowNoteWindow(window);
+        return 0;
+
+    case kToggleAlwaysOnTopMessage:
+        ToggleAlwaysOnTop(window);
         return 0;
 
     case WM_PAINT: {
@@ -871,8 +1055,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput,
+                                nullptr) != Gdiplus::Ok) {
+        return 1;
+    }
+
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
     if (mutex == nullptr) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -880,6 +1071,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         if (existing != nullptr) {
             PostMessageW(existing, kShowMessage, 0, 0);
         }
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
         CloseHandle(mutex);
         return 0;
     }
@@ -909,10 +1101,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(kApplicationIconId));
+    windowClass.hIconSm = windowClass.hIcon;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.lpszClassName = kWindowClassName;
     if (RegisterClassExW(&windowClass) == 0) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
         CloseHandle(mutex);
         return 1;
     }
@@ -925,14 +1119,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const int top = (screenHeight - height) / 2;
 
     HWND window = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kWindowClassName, kWindowTitle,
+        WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
         WS_POPUP, left, top, width, height, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) {
         UnregisterClassW(kWindowClassName, instance);
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
         CloseHandle(mutex);
         return 1;
     }
     g_app.window = window;
+    ApplyAlwaysOnTop(window, settings.alwaysOnTop);
 
     if (!AddTrayIcon(window)) {
         MessageBoxW(window, L"无法创建通知区域图标，程序仍会运行。", L"Notease",
@@ -954,5 +1150,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     UnregisterClassW(kWindowClassName, instance);
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return static_cast<int>(message.wParam);
 }
