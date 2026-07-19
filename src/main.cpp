@@ -675,9 +675,6 @@ void ShowNoteWindow(HWND window) {
                  0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(window);
-    if (g_app.editor != nullptr) {
-        SetFocus(g_app.editor);
-    }
 }
 
 void HideNoteWindow(HWND window) {
@@ -1208,7 +1205,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     ShowWindow(window, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
     UpdateWindow(window);
-    SetFocus(g_app.editor);
 
     if (!startupWarning.empty()) {
         ShowError(startupWarning);
