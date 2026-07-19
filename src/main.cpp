@@ -74,6 +74,7 @@ struct AppState {
     NOTIFYICONDATAW tray{};
     UINT taskbarCreatedMessage = 0;
     bool trayAdded = false;
+    bool loadingEditor = false;
     Settings settings{};
 };
 
@@ -328,7 +329,11 @@ bool ParseJsonStringAt(const std::string& json, size_t& position,
     while (position < json.size()) {
         const unsigned char character = static_cast<unsigned char>(json[position++]);
         if (character == '"') return true;
-        if (character != '\\' || position >= json.size()) return false;
+        if (character != '\\') {
+            value += static_cast<char>(character);
+            continue;
+        }
+        if (position >= json.size()) return false;
         const char escaped = json[position++];
         switch (escaped) {
         case '"': value += '"'; break;
@@ -428,7 +433,8 @@ bool ReadUtf8File(const std::filesystem::path& path, std::string& content) {
 std::wstring LoadNoteText() {
     std::string json;
     std::string note;
-    if (ReadUtf8File(NoteaseFilePath(), json) && ParseJsonStringField(json, "note", note)) {
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonStringField(json, "note", note)) {
         return Utf8ToWide(note);
     }
     return {};
@@ -898,6 +904,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
     switch (message) {
     case WM_CREATE: {
+        // Setting the initial text sends EN_CHANGE. Ignore that notification
+        // so startup cannot schedule a save before the editor is initialized.
+        g_app.loadingEditor = true;
         g_app.editor = CreateWindowExW(
             0, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
@@ -936,7 +945,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                               reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
         SendMessageW(g_app.editor, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
         UpdateEditorFont(window);
-        SetWindowTextW(g_app.editor, LoadNoteText().c_str());
+        const std::wstring note = LoadNoteText();
+        SetWindowTextW(g_app.editor, note.c_str());
+        g_app.loadingEditor = false;
         LayoutControls(window);
         SetWindowRegion(window);
         return 0;
@@ -989,6 +1000,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lParam) == g_app.editor &&
             HIWORD(wParam) == EN_CHANGE) {
+            if (g_app.loadingEditor) {
+                return 0;
+            }
             SetTimer(window, kSaveTimer, 500, nullptr);
             return 0;
         }
@@ -1088,12 +1102,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         return 1;
 
     case WM_CLOSE:
+        // Save before destroying the parent window. During DestroyWindow,
+        // the child editor may already be gone by the time WM_DESTROY runs.
+        KillTimer(window, kSaveTimer);
+        SaveNoteText(g_app.editor);
         DestroyWindow(window);
         return 0;
 
     case WM_DESTROY:
-        KillTimer(window, kSaveTimer);
-        SaveNoteText(g_app.editor);
         RemoveTrayIcon();
         if (g_app.editorFont != nullptr) {
             DeleteObject(g_app.editorFont);
@@ -1151,14 +1167,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (!SetAutoStartEnabled(settings.autoStart, &startupWarning)) {
         startupWarning = L"自启动设置同步失败：" + startupWarning;
     }
-    std::wstring settingsError;
-    if (!SaveSettings(settings, &settingsError)) {
-        if (!startupWarning.empty()) {
-            startupWarning += L"\n";
-        }
-        startupWarning += settingsError;
-    }
-
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
