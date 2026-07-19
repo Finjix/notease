@@ -898,8 +898,10 @@ void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
         const double angle = g_app.settings.alwaysOnTop ? 0.0 : diagonalAngle;
         const double sine = std::sin(angle);
         const double cosine = std::cos(angle);
-        const double scale =
-            static_cast<double>(ScaleForDpi(1, g_app.window)) * 0.58;
+        // Keep the custom shape at a stable visual size. The button itself
+        // still scales with DPI, while scaling this shape again made it too
+        // large on high-DPI displays.
+        constexpr double scale = 0.90;
         const POINT shape[] = {
             {-6, -8}, {6, -8}, {6, -5}, {4, -5}, {4, -1}, {7, 1},
             {7, 3}, {2, 3}, {2, 7}, {0, 11}, {-2, 7}, {-2, 3},
