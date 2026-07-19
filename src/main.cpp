@@ -570,19 +570,26 @@ bool LoadSettings(Settings& settings) {
     return !json.empty();
 }
 
-bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr) {
-    return SaveNoteaseFile(LoadNoteText(), settings, errorMessage);
-}
-
-bool SaveNoteText(HWND editor, const Settings& settings) {
-    if (editor == nullptr) return false;
+std::wstring ReadEditorText(HWND editor) {
+    if (editor == nullptr) return {};
 
     const int length = GetWindowTextLengthW(editor);
     std::wstring content(length + 1, L'\0');
     GetWindowTextW(editor, content.data(), length + 1);
     content.resize(length);
+    return content;
+}
 
-    return SaveNoteaseFile(content, settings);
+bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr) {
+    const std::wstring note = g_app.editor == nullptr
+                                  ? LoadNoteText()
+                                  : ReadEditorText(g_app.editor);
+    return SaveNoteaseFile(note, settings, errorMessage);
+}
+
+bool SaveNoteText(HWND editor, const Settings& settings) {
+    if (editor == nullptr) return false;
+    return SaveNoteaseFile(ReadEditorText(editor), settings);
 }
 
 void ApplyAlwaysOnTop(HWND window, bool alwaysOnTop) {
