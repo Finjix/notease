@@ -26,7 +26,7 @@ $resourceObject = Join-Path $buildDirectory 'resource.res'
 $output = Join-Path $buildDirectory 'Notease.exe'
 $objectFile = Join-Path $buildDirectory 'main.obj'
 
-$command = "`"$vcvars`" x64 && rc /nologo /fo `"$resourceObject`" `"$resource`" && cl /nologo /utf-8 /std:c++17 /EHsc /W4 /permissive- /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /Fo:`"$objectFile`" /Fe:`"$output`" `"$source`" `"$resourceObject`" /link /SUBSYSTEM:WINDOWS advapi32.lib gdi32.lib shell32.lib user32.lib gdiplus.lib"
+$command = "`"$vcvars`" x64 && rc /nologo /fo `"$resourceObject`" `"$resource`" && cl /nologo /utf-8 /std:c++17 /EHsc /W4 /permissive- /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /Fo:`"$objectFile`" /Fe:`"$output`" `"$source`" `"$resourceObject`" /link /SUBSYSTEM:WINDOWS advapi32.lib dwmapi.lib gdi32.lib shell32.lib user32.lib gdiplus.lib"
 cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) {
     throw "编译失败，退出码：$LASTEXITCODE"

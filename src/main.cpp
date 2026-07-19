@@ -13,6 +13,7 @@
 #define _WIN32_WINNT 0x0A00
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <shellapi.h>
@@ -53,8 +54,13 @@ constexpr UINT kTrayExitCommand = 1003;
 
 constexpr int kNormalWidth = 380;
 constexpr int kNormalHeight = 280;
+constexpr int kMinimumWidth = 260;
+constexpr int kMinimumHeight = 180;
 constexpr int kTitleBarHeight = 32;
 constexpr int kTitleHoverWidth = 88;
+constexpr int kResizeBorderWidth = 6;
+constexpr DWORD kDwmBorderColorAttribute = 34;
+constexpr DWORD kDwmColorNone = 0xfffffffe;
 
 struct Settings {
     bool autoStart = true;
@@ -62,6 +68,9 @@ struct Settings {
     bool windowPositionValid = false;
     int windowLeft = 0;
     int windowTop = 0;
+    bool windowSizeValid = false;
+    int windowWidth = 0;
+    int windowHeight = 0;
 };
 
 struct AppState {
@@ -496,7 +505,11 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
          << ",\n  \"windowPositionValid\": "
          << (settings.windowPositionValid ? "true" : "false")
          << ",\n  \"windowLeft\": " << settings.windowLeft
-         << ",\n  \"windowTop\": " << settings.windowTop << "\n}\n";
+         << ",\n  \"windowTop\": " << settings.windowTop
+         << ",\n  \"windowSizeValid\": "
+         << (settings.windowSizeValid ? "true" : "false")
+         << ",\n  \"windowWidth\": " << settings.windowWidth
+         << ",\n  \"windowHeight\": " << settings.windowHeight << "\n}\n";
     file.flush();
     if (!file) {
         file.close();
@@ -538,6 +551,21 @@ bool LoadSettings(Settings& settings) {
     if (ReadUtf8File(NoteaseFilePath(), json) &&
         ParseJsonIntField(json, "windowTop", windowTop)) {
         settings.windowTop = windowTop;
+    }
+    bool windowSizeValid = settings.windowSizeValid;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonBoolField(json, "windowSizeValid", windowSizeValid)) {
+        settings.windowSizeValid = windowSizeValid;
+    }
+    int windowWidth = settings.windowWidth;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonIntField(json, "windowWidth", windowWidth)) {
+        settings.windowWidth = windowWidth;
+    }
+    int windowHeight = settings.windowHeight;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonIntField(json, "windowHeight", windowHeight)) {
+        settings.windowHeight = windowHeight;
     }
     return !json.empty();
 }
@@ -641,6 +669,12 @@ void SetWindowRegion(HWND window) {
     if (region != nullptr && SetWindowRgn(window, region, TRUE) == 0) {
         DeleteObject(region);
     }
+}
+
+void DisableDwmBorder(HWND window) {
+    const DWORD color = kDwmColorNone;
+    DwmSetWindowAttribute(window, kDwmBorderColorAttribute, &color,
+                          sizeof(color));
 }
 
 void LayoutEditor(HWND window) {
@@ -1012,9 +1046,34 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         SetWindowRegion(window);
         return 0;
 
+    case WM_NCACTIVATE:
+        return TRUE;
+
+    case WM_NCPAINT:
+        return 0;
+
+    case WM_NCCALCSIZE:
+        return 0;
+
     case WM_NCHITTEST: {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(window, &point);
+        RECT client{};
+        GetClientRect(window, &client);
+        const int resizeBorder = ScaleForDpi(kResizeBorderWidth, window);
+        const bool resizeLeft = point.x < client.left + resizeBorder;
+        const bool resizeRight = point.x >= client.right - resizeBorder;
+        const bool resizeTop = point.y < client.top + resizeBorder;
+        const bool resizeBottom = point.y >= client.bottom - resizeBorder;
+        if (resizeTop && resizeLeft) return HTTOPLEFT;
+        if (resizeTop && resizeRight) return HTTOPRIGHT;
+        if (resizeBottom && resizeLeft) return HTBOTTOMLEFT;
+        if (resizeBottom && resizeRight) return HTBOTTOMRIGHT;
+        if (resizeLeft) return HTLEFT;
+        if (resizeRight) return HTRIGHT;
+        if (resizeTop) return HTTOP;
+        if (resizeBottom) return HTBOTTOM;
+
         const int titleHeight = ScaleForDpi(kTitleBarHeight, window);
         if (point.y < titleHeight) {
             if (point.x >= ScaleForDpi(10, window) &&
@@ -1029,6 +1088,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             return HTCAPTION;
         }
         return HTCLIENT;
+    }
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        if (limits != nullptr) {
+            limits->ptMinTrackSize.x = ScaleForDpi(kMinimumWidth, window);
+            limits->ptMinTrackSize.y = ScaleForDpi(kMinimumHeight, window);
+        }
+        return 0;
     }
 
     case WM_LBUTTONUP: {
@@ -1158,6 +1226,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             g_app.settings.windowPositionValid = true;
             g_app.settings.windowLeft = windowRectangle.left;
             g_app.settings.windowTop = windowRectangle.top;
+            g_app.settings.windowSizeValid = true;
+            g_app.settings.windowWidth = windowRectangle.right - windowRectangle.left;
+            g_app.settings.windowHeight = windowRectangle.bottom - windowRectangle.top;
         }
         SaveNoteText(g_app.editor, g_app.settings);
         DestroyWindow(window);
@@ -1237,8 +1308,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    const int width = ScaleForDpi(kNormalWidth, nullptr);
-    const int height = ScaleForDpi(kNormalHeight, nullptr);
+    const int minimumWidth = ScaleForDpi(kMinimumWidth, nullptr);
+    const int minimumHeight = ScaleForDpi(kMinimumHeight, nullptr);
+    int width = ScaleForDpi(kNormalWidth, nullptr);
+    int height = ScaleForDpi(kNormalHeight, nullptr);
+    if (settings.windowSizeValid) {
+        width = std::max(minimumWidth, settings.windowWidth);
+        height = std::max(minimumHeight, settings.windowHeight);
+    }
     const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int left = (screenWidth - width) / 2;
@@ -1246,26 +1323,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (settings.windowPositionValid) {
         left = settings.windowLeft;
         top = settings.windowTop;
+    }
 
-        RECT savedRectangle{left, top, left + width, top + height};
-        HMONITOR monitor = MonitorFromRect(&savedRectangle, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO monitorInfo{sizeof(monitorInfo)};
-        if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo)) {
-            const RECT workArea = monitorInfo.rcWork;
-            const int workLeft = static_cast<int>(workArea.left);
-            const int workTop = static_cast<int>(workArea.top);
-            const int workRight = static_cast<int>(workArea.right);
-            const int workBottom = static_cast<int>(workArea.bottom);
-            const int maxLeft = std::max(workLeft, workRight - width);
-            const int maxTop = std::max(workTop, workBottom - height);
-            left = std::clamp(left, workLeft, maxLeft);
-            top = std::clamp(top, workTop, maxTop);
-        }
+    RECT savedRectangle{left, top, left + width, top + height};
+    HMONITOR monitor = MonitorFromRect(&savedRectangle, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo)) {
+        const RECT workArea = monitorInfo.rcWork;
+        const int workLeft = static_cast<int>(workArea.left);
+        const int workTop = static_cast<int>(workArea.top);
+        const int workRight = static_cast<int>(workArea.right);
+        const int workBottom = static_cast<int>(workArea.bottom);
+        width = std::min(width, std::max(minimumWidth, workRight - workLeft));
+        height = std::min(height, std::max(minimumHeight, workBottom - workTop));
+        const int maxLeft = std::max(workLeft, workRight - width);
+        const int maxTop = std::max(workTop, workBottom - height);
+        left = std::clamp(left, workLeft, maxLeft);
+        top = std::clamp(top, workTop, maxTop);
     }
 
     HWND window = CreateWindowExW(
         WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
-        WS_POPUP, left, top, width, height, nullptr, nullptr, instance, nullptr);
+        WS_POPUP | WS_THICKFRAME, left, top, width, height, nullptr, nullptr,
+        instance, nullptr);
     if (window == nullptr) {
         UnregisterClassW(kWindowClassName, instance);
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
@@ -1273,6 +1353,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
     g_app.window = window;
+    DisableDwmBorder(window);
     ApplyAlwaysOnTop(window, settings.alwaysOnTop);
 
     if (!AddTrayIcon(window)) {

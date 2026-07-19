@@ -18,6 +18,7 @@ target_compile_definitions(Notease PRIVATE
 
 target_link_libraries(Notease PRIVATE
     advapi32
+    dwmapi
     gdi32
     shell32
     user32

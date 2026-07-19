@@ -24,7 +24,10 @@ Notease 是一个原生 C++ / Win32 桌面悬浮便签，提供简洁的多行�
   "alwaysOnTop": false,
   "windowPositionValid": true,
   "windowLeft": 500,
-  "windowTop": 300
+  "windowTop": 300,
+  "windowSizeValid": true,
+  "windowWidth": 380,
+  "windowHeight": 280
 }
 ```
 
