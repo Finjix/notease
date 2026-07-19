@@ -52,7 +52,6 @@ constexpr UINT kTrayExitCommand = 1003;
 
 constexpr int kNormalWidth = 380;
 constexpr int kNormalHeight = 280;
-constexpr int kCollapsedHeight = 32;
 constexpr int kTitleBarHeight = 32;
 constexpr int kTitleHoverWidth = 88;
 
@@ -75,9 +74,6 @@ struct AppState {
     NOTIFYICONDATAW tray{};
     UINT taskbarCreatedMessage = 0;
     bool trayAdded = false;
-    bool collapsed = false;
-    int normalWidth = kNormalWidth;
-    int normalHeight = kNormalHeight;
     Settings settings{};
 };
 
@@ -128,6 +124,12 @@ LRESULT CALLBACK ButtonWindowProc(HWND window, UINT message, WPARAM wParam,
     }
     if (message == WM_LBUTTONDOWN) {
         SetCapture(window);
+        return 0;
+    }
+    if (message == WM_CANCELMODE || message == WM_CAPTURECHANGED) {
+        if (GetCapture() == window) {
+            ReleaseCapture();
+        }
         return 0;
     }
     if (message == WM_LBUTTONUP) {
@@ -290,17 +292,38 @@ std::string JsonEscape(const std::string& value) {
     return result;
 }
 
-bool ParseJsonStringField(const std::string& json, const std::string& key,
-                          std::string& value) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t keyPosition = json.find(marker);
-    if (keyPosition == std::string::npos) return false;
-    size_t position = json.find(':', keyPosition + marker.size());
-    if (position == std::string::npos) return false;
-    ++position;
-    while (position < json.size() && isspace(static_cast<unsigned char>(json[position]))) ++position;
-    if (position >= json.size() || json[position] != '"') return false;
-    ++position;
+size_t SkipJsonWhitespace(const std::string& json, size_t position) {
+    while (position < json.size() &&
+           isspace(static_cast<unsigned char>(json[position]))) {
+        ++position;
+    }
+    return position;
+}
+
+bool AppendUtf8CodePoint(std::string& value, unsigned int codePoint) {
+    if (codePoint <= 0x7f) {
+        value += static_cast<char>(codePoint);
+    } else if (codePoint <= 0x7ff) {
+        value += static_cast<char>(0xc0 | (codePoint >> 6));
+        value += static_cast<char>(0x80 | (codePoint & 0x3f));
+    } else if (codePoint <= 0xffff) {
+        value += static_cast<char>(0xe0 | (codePoint >> 12));
+        value += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f));
+        value += static_cast<char>(0x80 | (codePoint & 0x3f));
+    } else if (codePoint <= 0x10ffff) {
+        value += static_cast<char>(0xf0 | (codePoint >> 18));
+        value += static_cast<char>(0x80 | ((codePoint >> 12) & 0x3f));
+        value += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f));
+        value += static_cast<char>(0x80 | (codePoint & 0x3f));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool ParseJsonStringAt(const std::string& json, size_t& position,
+                       std::string& value) {
+    if (position >= json.size() || json[position++] != '"') return false;
     value.clear();
     while (position < json.size()) {
         const unsigned char character = static_cast<unsigned char>(json[position++]);
@@ -315,22 +338,74 @@ bool ParseJsonStringField(const std::string& json, const std::string& key,
         case 'n': value += '\n'; break;
         case 'r': value += '\r'; break;
         case 't': value += '\t'; break;
+        case 'u': {
+            if (position + 4 > json.size()) return false;
+            unsigned int codePoint = 0;
+            for (int index = 0; index < 4; ++index) {
+                const char digit = json[position++];
+                codePoint <<= 4;
+                if (digit >= '0' && digit <= '9') codePoint += digit - '0';
+                else if (digit >= 'a' && digit <= 'f') codePoint += digit - 'a' + 10;
+                else if (digit >= 'A' && digit <= 'F') codePoint += digit - 'A' + 10;
+                else return false;
+            }
+            if (!AppendUtf8CodePoint(value, codePoint)) return false;
+            break;
+        }
         default: return false;
         }
     }
     return false;
 }
 
+bool FindJsonFieldValue(const std::string& json, const std::string& key,
+                        size_t& valuePosition) {
+    size_t position = SkipJsonWhitespace(json, 0);
+    if (position >= json.size() || json[position++] != '{') return false;
+    while (true) {
+        position = SkipJsonWhitespace(json, position);
+        if (position >= json.size() || json[position] == '}') return false;
+        std::string fieldName;
+        if (!ParseJsonStringAt(json, position, fieldName)) return false;
+        position = SkipJsonWhitespace(json, position);
+        if (position >= json.size() || json[position++] != ':') return false;
+        position = SkipJsonWhitespace(json, position);
+        if (fieldName == key) {
+            valuePosition = position;
+            return true;
+        }
+        if (position < json.size() && json[position] == '"') {
+            std::string ignored;
+            if (!ParseJsonStringAt(json, position, ignored)) return false;
+        } else {
+            while (position < json.size() && json[position] != ',' &&
+                   json[position] != '}') {
+                ++position;
+            }
+        }
+        position = SkipJsonWhitespace(json, position);
+        if (position >= json.size() || json[position++] != ',') return false;
+    }
+}
+
+bool ParseJsonStringField(const std::string& json, const std::string& key,
+                          std::string& value) {
+    size_t position = 0;
+    return FindJsonFieldValue(json, key, position) &&
+           ParseJsonStringAt(json, position, value);
+}
+
 bool ParseJsonBoolField(const std::string& json, const std::string& key, bool& value) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t keyPosition = json.find(marker);
-    if (keyPosition == std::string::npos) return false;
-    size_t position = json.find(':', keyPosition + marker.size());
-    if (position == std::string::npos) return false;
-    ++position;
-    while (position < json.size() && isspace(static_cast<unsigned char>(json[position]))) ++position;
-    if (json.compare(position, 4, "true") == 0) { value = true; return true; }
-    if (json.compare(position, 5, "false") == 0) { value = false; return true; }
+    size_t position = 0;
+    if (!FindJsonFieldValue(json, key, position)) return false;
+    if (json.compare(position, 4, "true") == 0) {
+        value = true;
+        return true;
+    }
+    if (json.compare(position, 5, "false") == 0) {
+        value = false;
+        return true;
+    }
     return false;
 }
 
@@ -366,7 +441,9 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
         if (errorMessage != nullptr) *errorMessage = L"无法定位或创建 exe 所在目录。";
         return false;
     }
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    std::filesystem::path temporaryPath = path;
+    temporaryPath += L".tmp";
+    std::ofstream file(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         if (errorMessage != nullptr) *errorMessage = L"无法写入 " + path.wstring() + L"。";
         return false;
@@ -376,7 +453,19 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
          << "\",\n  \"autostart\": " << (settings.autoStart ? "true" : "false")
          << ",\n  \"alwaysOnTop\": "
          << (settings.alwaysOnTop ? "true" : "false") << "\n}\n";
-    return static_cast<bool>(file);
+    file.flush();
+    if (!file) {
+        file.close();
+        DeleteFileW(temporaryPath.c_str());
+        return false;
+    }
+    file.close();
+    if (!MoveFileExW(temporaryPath.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporaryPath.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool LoadSettings(Settings& settings) {
@@ -502,11 +591,7 @@ void LayoutEditor(HWND window) {
         return;
     }
 
-    const bool visible = !g_app.collapsed;
-    ShowWindow(g_app.editor, visible ? SW_SHOW : SW_HIDE);
-    if (!visible) {
-        return;
-    }
+    ShowWindow(g_app.editor, SW_SHOW);
 
     RECT client{};
     GetClientRect(window, &client);
@@ -579,19 +664,6 @@ void UpdateEditorFont(HWND window) {
 }
 
 void ShowNoteWindow(HWND window) {
-    if (g_app.collapsed) {
-        g_app.collapsed = false;
-        RECT rectangle{};
-        GetWindowRect(window, &rectangle);
-        SetWindowPos(window, g_app.settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
-                     rectangle.left, rectangle.top,
-                     rectangle.right - rectangle.left, g_app.normalHeight,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        SetWindowTextW(g_app.collapseButton, L"");
-        LayoutControls(window);
-        InvalidateRect(window, nullptr, FALSE);
-    }
-
     ShowWindow(window, SW_SHOWNORMAL);
     SetWindowPos(window, g_app.settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                  0, 0, 0, 0,
@@ -826,15 +898,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
 
     switch (message) {
     case WM_CREATE: {
-        g_app.normalWidth = ScaleForDpi(kNormalWidth, window);
-        g_app.normalHeight = ScaleForDpi(kNormalHeight, window);
-        RECT initialWindow{};
-        if (GetWindowRect(window, &initialWindow) &&
-            initialWindow.bottom > initialWindow.top &&
-            initialWindow.right > initialWindow.left) {
-            g_app.normalWidth = initialWindow.right - initialWindow.left;
-            g_app.normalHeight = initialWindow.bottom - initialWindow.top;
-        }
         g_app.editor = CreateWindowExW(
             0, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
