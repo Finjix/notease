@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,9 @@ constexpr int kTitleHoverWidth = 88;
 struct Settings {
     bool autoStart = true;
     bool alwaysOnTop = false;
+    bool windowPositionValid = false;
+    int windowLeft = 0;
+    int windowTop = 0;
 };
 
 struct AppState {
@@ -414,6 +418,36 @@ bool ParseJsonBoolField(const std::string& json, const std::string& key, bool& v
     return false;
 }
 
+bool ParseJsonIntField(const std::string& json, const std::string& key, int& value) {
+    size_t position = 0;
+    if (!FindJsonFieldValue(json, key, position) || position >= json.size()) {
+        return false;
+    }
+
+    const size_t start = position;
+    if (json[position] == '-') {
+        ++position;
+    }
+    const size_t digitsStart = position;
+    while (position < json.size() &&
+           std::isdigit(static_cast<unsigned char>(json[position]))) {
+        ++position;
+    }
+    if (position == digitsStart) return false;
+
+    try {
+        const long long parsed = std::stoll(json.substr(start, position - start));
+        if (parsed < std::numeric_limits<int>::min() ||
+            parsed > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        value = static_cast<int>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool ReadUtf8File(const std::filesystem::path& path, std::string& content) {
     if (path.empty()) {
         return false;
@@ -458,7 +492,11 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
     file << "{\n  \"note\": \"" << JsonEscape(utf8)
          << "\",\n  \"autostart\": " << (settings.autoStart ? "true" : "false")
          << ",\n  \"alwaysOnTop\": "
-         << (settings.alwaysOnTop ? "true" : "false") << "\n}\n";
+         << (settings.alwaysOnTop ? "true" : "false")
+         << ",\n  \"windowPositionValid\": "
+         << (settings.windowPositionValid ? "true" : "false")
+         << ",\n  \"windowLeft\": " << settings.windowLeft
+         << ",\n  \"windowTop\": " << settings.windowTop << "\n}\n";
     file.flush();
     if (!file) {
         file.close();
@@ -486,6 +524,21 @@ bool LoadSettings(Settings& settings) {
         ParseJsonBoolField(json, "alwaysOnTop", alwaysOnTop)) {
         settings.alwaysOnTop = alwaysOnTop;
     }
+    bool windowPositionValid = settings.windowPositionValid;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonBoolField(json, "windowPositionValid", windowPositionValid)) {
+        settings.windowPositionValid = windowPositionValid;
+    }
+    int windowLeft = settings.windowLeft;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonIntField(json, "windowLeft", windowLeft)) {
+        settings.windowLeft = windowLeft;
+    }
+    int windowTop = settings.windowTop;
+    if (ReadUtf8File(NoteaseFilePath(), json) &&
+        ParseJsonIntField(json, "windowTop", windowTop)) {
+        settings.windowTop = windowTop;
+    }
     return !json.empty();
 }
 
@@ -493,7 +546,7 @@ bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr
     return SaveNoteaseFile(LoadNoteText(), settings, errorMessage);
 }
 
-bool SaveNoteText(HWND editor) {
+bool SaveNoteText(HWND editor, const Settings& settings) {
     if (editor == nullptr) return false;
 
     const int length = GetWindowTextLengthW(editor);
@@ -501,8 +554,6 @@ bool SaveNoteText(HWND editor) {
     GetWindowTextW(editor, content.data(), length + 1);
     content.resize(length);
 
-    Settings settings;
-    LoadSettings(settings);
     return SaveNoteaseFile(content, settings);
 }
 
@@ -678,7 +729,7 @@ void ShowNoteWindow(HWND window) {
 }
 
 void HideNoteWindow(HWND window) {
-    SaveNoteText(g_app.editor);
+    SaveNoteText(g_app.editor, g_app.settings);
     ShowWindow(window, SW_HIDE);
 }
 
@@ -987,7 +1038,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             GET_X_LPARAM(lParam) >= ScaleForDpi(10, window) &&
             GET_X_LPARAM(lParam) < titleClickWidth) {
             SetWindowTextW(g_app.editor, L"");
-            SaveNoteText(g_app.editor);
+            SaveNoteText(g_app.editor, g_app.settings);
             SetFocus(g_app.editor);
             return 0;
         }
@@ -1036,7 +1087,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
     case WM_TIMER:
         if (wParam == kSaveTimer) {
             KillTimer(window, kSaveTimer);
-            SaveNoteText(g_app.editor);
+            SaveNoteText(g_app.editor, g_app.settings);
             return 0;
         }
         break;
@@ -1098,13 +1149,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
     case WM_ERASEBKGND:
         return 1;
 
-    case WM_CLOSE:
+    case WM_CLOSE: {
         // Save before destroying the parent window. During DestroyWindow,
         // the child editor may already be gone by the time WM_DESTROY runs.
         KillTimer(window, kSaveTimer);
-        SaveNoteText(g_app.editor);
+        RECT windowRectangle{};
+        if (GetWindowRect(window, &windowRectangle)) {
+            g_app.settings.windowPositionValid = true;
+            g_app.settings.windowLeft = windowRectangle.left;
+            g_app.settings.windowTop = windowRectangle.top;
+        }
+        SaveNoteText(g_app.editor, g_app.settings);
         DestroyWindow(window);
         return 0;
+    }
 
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -1183,8 +1241,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const int height = ScaleForDpi(kNormalHeight, nullptr);
     const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    const int left = (screenWidth - width) / 2;
-    const int top = (screenHeight - height) / 2;
+    int left = (screenWidth - width) / 2;
+    int top = (screenHeight - height) / 2;
+    if (settings.windowPositionValid) {
+        left = settings.windowLeft;
+        top = settings.windowTop;
+
+        RECT savedRectangle{left, top, left + width, top + height};
+        HMONITOR monitor = MonitorFromRect(&savedRectangle, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo)) {
+            const RECT workArea = monitorInfo.rcWork;
+            const int workLeft = static_cast<int>(workArea.left);
+            const int workTop = static_cast<int>(workArea.top);
+            const int workRight = static_cast<int>(workArea.right);
+            const int workBottom = static_cast<int>(workArea.bottom);
+            const int maxLeft = std::max(workLeft, workRight - width);
+            const int maxTop = std::max(workTop, workBottom - height);
+            left = std::clamp(left, workLeft, maxLeft);
+            top = std::clamp(top, workTop, maxTop);
+        }
+    }
 
     HWND window = CreateWindowExW(
         WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
