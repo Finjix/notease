@@ -592,6 +592,25 @@ bool SaveNoteText(HWND editor, const Settings& settings) {
     return SaveNoteaseFile(ReadEditorText(editor), settings);
 }
 
+void CaptureWindowGeometry(HWND window) {
+    RECT windowRectangle{};
+    if (!GetWindowRect(window, &windowRectangle)) {
+        return;
+    }
+
+    g_app.settings.windowPositionValid = true;
+    g_app.settings.windowLeft = windowRectangle.left;
+    g_app.settings.windowTop = windowRectangle.top;
+    g_app.settings.windowSizeValid = true;
+    g_app.settings.windowWidth = windowRectangle.right - windowRectangle.left;
+    g_app.settings.windowHeight = windowRectangle.bottom - windowRectangle.top;
+}
+
+void SaveCurrentWindowState(HWND window) {
+    CaptureWindowGeometry(window);
+    SaveNoteText(g_app.editor, g_app.settings);
+}
+
 void ApplyAlwaysOnTop(HWND window, bool alwaysOnTop) {
     SetWindowPos(window, alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0,
                  0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -1055,6 +1074,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         SetWindowRegion(window);
         return 0;
 
+    case WM_EXITSIZEMOVE:
+        // Persist the final position and size as soon as an interactive move
+        // or resize ends. WM_CLOSE is not guaranteed for hiding, logoff, or
+        // a system restart.
+        KillTimer(window, kSaveTimer);
+        SaveCurrentWindowState(window);
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        SaveCurrentWindowState(window);
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wParam != FALSE) {
+            SaveCurrentWindowState(window);
+        }
+        return 0;
+
     case WM_NCACTIVATE:
         return TRUE;
 
@@ -1230,16 +1267,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         // Save before destroying the parent window. During DestroyWindow,
         // the child editor may already be gone by the time WM_DESTROY runs.
         KillTimer(window, kSaveTimer);
-        RECT windowRectangle{};
-        if (GetWindowRect(window, &windowRectangle)) {
-            g_app.settings.windowPositionValid = true;
-            g_app.settings.windowLeft = windowRectangle.left;
-            g_app.settings.windowTop = windowRectangle.top;
-            g_app.settings.windowSizeValid = true;
-            g_app.settings.windowWidth = windowRectangle.right - windowRectangle.left;
-            g_app.settings.windowHeight = windowRectangle.bottom - windowRectangle.top;
-        }
-        SaveNoteText(g_app.editor, g_app.settings);
+        SaveCurrentWindowState(window);
         DestroyWindow(window);
         return 0;
     }
