@@ -46,8 +46,10 @@ constexpr UINT kSaveTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
 constexpr int kEditorControlId = 2001;
-constexpr int kCollapseButtonId = 2002;
-constexpr int kHideButtonId = 2003;
+constexpr int kNewButtonId = 2002;
+constexpr int kCollapseButtonId = 2003;
+constexpr int kHideButtonId = 2004;
+constexpr int kDeleteButtonId = 2005;
 
 constexpr UINT kTrayAutoStartCommand = 1002;
 constexpr UINT kTrayExitCommand = 1003;
@@ -73,17 +75,42 @@ struct Settings {
     int windowHeight = 0;
 };
 
-struct AppState {
+struct PersistedInstance {
+    int id = 0;
+    std::wstring note;
+    Settings settings{};
+};
+
+struct WindowState {
     HINSTANCE instance = nullptr;
     HWND window = nullptr;
     HWND editor = nullptr;
     WNDPROC editorWindowProc = nullptr;
+    HWND newButton = nullptr;
     HWND collapseButton = nullptr;
     HWND hideButton = nullptr;
+    HWND deleteButton = nullptr;
+    WNDPROC newButtonWindowProc = nullptr;
     WNDPROC collapseButtonWindowProc = nullptr;
     WNDPROC hideButtonWindowProc = nullptr;
-    HANDLE mutex = nullptr;
+    WNDPROC deleteButtonWindowProc = nullptr;
     HFONT editorFont = nullptr;
+    bool loadingEditor = false;
+    bool mother = false;
+    bool deleted = false;
+    bool registered = false;
+    int instanceId = 0;
+    std::wstring initialText;
+    Settings settings{};
+};
+
+struct AppState {
+    HINSTANCE instance = nullptr;
+    WindowState* mother = nullptr;
+    std::vector<WindowState*> windows;
+    std::vector<PersistedInstance> pendingInstances;
+    int nextInstanceId = 1;
+    HANDLE mutex = nullptr;
     NOTIFYICONDATAW tray{};
     UINT taskbarCreatedMessage = 0;
     bool trayAdded = false;
@@ -92,7 +119,17 @@ struct AppState {
 };
 
 AppState g_app;
+WindowState g_mother;
 ULONG_PTR g_gdiplusToken = 0;
+
+WindowState* GetWindowState(HWND window) {
+    return reinterpret_cast<WindowState*>(GetWindowLongPtrW(
+        window, GWLP_USERDATA));
+}
+
+WindowState* GetButtonWindowState(HWND button) {
+    return GetWindowState(GetParent(button));
+}
 
 LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wParam,
                                   LPARAM lParam) {
@@ -113,16 +150,29 @@ LRESULT CALLBACK EditorWindowProc(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
 
-    return CallWindowProcW(g_app.editorWindowProc, window, message, wParam,
-                           lParam);
+    WindowState* state = GetWindowState(GetParent(window));
+    return state == nullptr || state->editorWindowProc == nullptr
+               ? DefWindowProcW(window, message, wParam, lParam)
+               : CallWindowProcW(state->editorWindowProc, window, message,
+                                 wParam, lParam);
 }
 
 WNDPROC OriginalButtonWindowProc(HWND window) {
-    if (window == g_app.collapseButton) {
-        return g_app.collapseButtonWindowProc;
+    WindowState* state = GetButtonWindowState(window);
+    if (state == nullptr) {
+        return nullptr;
     }
-    if (window == g_app.hideButton) {
-        return g_app.hideButtonWindowProc;
+    if (window == state->newButton) {
+        return state->newButtonWindowProc;
+    }
+    if (window == state->collapseButton) {
+        return state->collapseButtonWindowProc;
+    }
+    if (window == state->hideButton) {
+        return state->hideButtonWindowProc;
+    }
+    if (window == state->deleteButton) {
+        return state->deleteButtonWindowProc;
     }
     return nullptr;
 }
@@ -376,6 +426,63 @@ bool ParseJsonStringAt(const std::string& json, size_t& position,
     return false;
 }
 
+bool SkipJsonValue(const std::string& json, size_t& position) {
+    position = SkipJsonWhitespace(json, position);
+    if (position >= json.size()) {
+        return false;
+    }
+
+    if (json[position] == '"') {
+        std::string ignored;
+        return ParseJsonStringAt(json, position, ignored);
+    }
+
+    if (json[position] == '{' || json[position] == '[') {
+        const char opening = json[position++];
+        const char closing = opening == '{' ? '}' : ']';
+        while (true) {
+            position = SkipJsonWhitespace(json, position);
+            if (position >= json.size()) {
+                return false;
+            }
+            if (json[position] == closing) {
+                ++position;
+                return true;
+            }
+            if (opening == '{') {
+                std::string ignoredKey;
+                if (!ParseJsonStringAt(json, position, ignoredKey)) {
+                    return false;
+                }
+                position = SkipJsonWhitespace(json, position);
+                if (position >= json.size() || json[position++] != ':') {
+                    return false;
+                }
+            }
+            if (!SkipJsonValue(json, position)) {
+                return false;
+            }
+            position = SkipJsonWhitespace(json, position);
+            if (position < json.size() && json[position] == ',') {
+                ++position;
+                continue;
+            }
+            if (position < json.size() && json[position] == closing) {
+                ++position;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    const size_t start = position;
+    while (position < json.size() && json[position] != ',' &&
+           json[position] != '}' && json[position] != ']') {
+        ++position;
+    }
+    return position > start;
+}
+
 bool FindJsonFieldValue(const std::string& json, const std::string& key,
                         size_t& valuePosition) {
     size_t position = SkipJsonWhitespace(json, 0);
@@ -392,17 +499,16 @@ bool FindJsonFieldValue(const std::string& json, const std::string& key,
             valuePosition = position;
             return true;
         }
-        if (position < json.size() && json[position] == '"') {
-            std::string ignored;
-            if (!ParseJsonStringAt(json, position, ignored)) return false;
-        } else {
-            while (position < json.size() && json[position] != ',' &&
-                   json[position] != '}') {
-                ++position;
-            }
-        }
+        if (!SkipJsonValue(json, position)) return false;
         position = SkipJsonWhitespace(json, position);
-        if (position >= json.size() || json[position++] != ',') return false;
+        if (position < json.size() && json[position] == ',') {
+            ++position;
+            continue;
+        }
+        if (position < json.size() && json[position] == '}') {
+            return false;
+        }
+        return false;
     }
 }
 
@@ -457,6 +563,64 @@ bool ParseJsonIntField(const std::string& json, const std::string& key, int& val
     }
 }
 
+bool ParseJsonInstances(const std::string& json,
+                        std::vector<PersistedInstance>& instances) {
+    size_t position = 0;
+    if (!FindJsonFieldValue(json, "instances", position)) {
+        return true;
+    }
+    position = SkipJsonWhitespace(json, position);
+    if (position >= json.size() || json[position++] != '[') {
+        return false;
+    }
+
+    while (true) {
+        position = SkipJsonWhitespace(json, position);
+        if (position >= json.size()) {
+            return false;
+        }
+        if (json[position] == ']') {
+            return true;
+        }
+        const size_t objectStart = position;
+        if (!SkipJsonValue(json, position) ||
+            json[objectStart] != '{' || position <= objectStart) {
+            return false;
+        }
+
+        const std::string object =
+            json.substr(objectStart, position - objectStart);
+        PersistedInstance instance;
+        ParseJsonIntField(object, "id", instance.id);
+        std::string note;
+        if (ParseJsonStringField(object, "note", note)) {
+            instance.note = Utf8ToWide(note);
+        }
+        ParseJsonBoolField(object, "alwaysOnTop", instance.settings.alwaysOnTop);
+        ParseJsonBoolField(object, "windowPositionValid",
+                           instance.settings.windowPositionValid);
+        ParseJsonIntField(object, "windowLeft", instance.settings.windowLeft);
+        ParseJsonIntField(object, "windowTop", instance.settings.windowTop);
+        ParseJsonBoolField(object, "windowSizeValid",
+                           instance.settings.windowSizeValid);
+        ParseJsonIntField(object, "windowWidth", instance.settings.windowWidth);
+        ParseJsonIntField(object, "windowHeight", instance.settings.windowHeight);
+        if (instance.id > 0) {
+            instances.push_back(std::move(instance));
+        }
+
+        position = SkipJsonWhitespace(json, position);
+        if (position < json.size() && json[position] == ',') {
+            ++position;
+            continue;
+        }
+        if (position < json.size() && json[position] == ']') {
+            return true;
+        }
+        return false;
+    }
+}
+
 bool ReadUtf8File(const std::filesystem::path& path, std::string& content) {
     if (path.empty()) {
         return false;
@@ -484,6 +648,7 @@ std::wstring LoadNoteText() {
 }
 
 bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
+                     const std::vector<PersistedInstance>& instances,
                      std::wstring* errorMessage = nullptr) {
     const std::filesystem::path path = NoteaseFilePath();
     if (path.empty() || !EnsureParentDirectory(path)) {
@@ -509,7 +674,28 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
          << ",\n  \"windowSizeValid\": "
          << (settings.windowSizeValid ? "true" : "false")
          << ",\n  \"windowWidth\": " << settings.windowWidth
-         << ",\n  \"windowHeight\": " << settings.windowHeight << "\n}\n";
+         << ",\n  \"windowHeight\": " << settings.windowHeight
+         << ",\n  \"instances\": [";
+    for (size_t index = 0; index < instances.size(); ++index) {
+        const PersistedInstance& instance = instances[index];
+        const Settings& instanceSettings = instance.settings;
+        file << (index == 0 ? "\n" : ",\n")
+             << "    {\n      \"id\": " << instance.id
+             << ",\n      \"note\": \""
+             << JsonEscape(WideToUtf8(instance.note))
+             << "\",\n      \"alwaysOnTop\": "
+             << (instanceSettings.alwaysOnTop ? "true" : "false")
+             << ",\n      \"windowPositionValid\": "
+             << (instanceSettings.windowPositionValid ? "true" : "false")
+             << ",\n      \"windowLeft\": " << instanceSettings.windowLeft
+             << ",\n      \"windowTop\": " << instanceSettings.windowTop
+             << ",\n      \"windowSizeValid\": "
+             << (instanceSettings.windowSizeValid ? "true" : "false")
+             << ",\n      \"windowWidth\": " << instanceSettings.windowWidth
+             << ",\n      \"windowHeight\": " << instanceSettings.windowHeight
+             << "\n    }";
+    }
+    file << (instances.empty() ? "]\n}\n" : "\n  ]\n}\n");
     file.flush();
     if (!file) {
         file.close();
@@ -528,44 +714,45 @@ bool SaveNoteaseFile(const std::wstring& note, const Settings& settings,
 bool LoadSettings(Settings& settings) {
     settings = Settings{};
     std::string json;
+    if (!ReadUtf8File(NoteaseFilePath(), json)) {
+        return false;
+    }
+
     bool autoStart = settings.autoStart;
-    if (ReadUtf8File(NoteaseFilePath(), json) && ParseJsonBoolField(json, "autostart", autoStart)) {
+    if (ParseJsonBoolField(json, "autostart", autoStart)) {
         settings.autoStart = autoStart;
     }
     bool alwaysOnTop = settings.alwaysOnTop;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonBoolField(json, "alwaysOnTop", alwaysOnTop)) {
+    if (ParseJsonBoolField(json, "alwaysOnTop", alwaysOnTop)) {
         settings.alwaysOnTop = alwaysOnTop;
     }
     bool windowPositionValid = settings.windowPositionValid;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonBoolField(json, "windowPositionValid", windowPositionValid)) {
+    if (ParseJsonBoolField(json, "windowPositionValid", windowPositionValid)) {
         settings.windowPositionValid = windowPositionValid;
     }
     int windowLeft = settings.windowLeft;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonIntField(json, "windowLeft", windowLeft)) {
+    if (ParseJsonIntField(json, "windowLeft", windowLeft)) {
         settings.windowLeft = windowLeft;
     }
     int windowTop = settings.windowTop;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonIntField(json, "windowTop", windowTop)) {
+    if (ParseJsonIntField(json, "windowTop", windowTop)) {
         settings.windowTop = windowTop;
     }
     bool windowSizeValid = settings.windowSizeValid;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonBoolField(json, "windowSizeValid", windowSizeValid)) {
+    if (ParseJsonBoolField(json, "windowSizeValid", windowSizeValid)) {
         settings.windowSizeValid = windowSizeValid;
     }
     int windowWidth = settings.windowWidth;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonIntField(json, "windowWidth", windowWidth)) {
+    if (ParseJsonIntField(json, "windowWidth", windowWidth)) {
         settings.windowWidth = windowWidth;
     }
     int windowHeight = settings.windowHeight;
-    if (ReadUtf8File(NoteaseFilePath(), json) &&
-        ParseJsonIntField(json, "windowHeight", windowHeight)) {
+    if (ParseJsonIntField(json, "windowHeight", windowHeight)) {
         settings.windowHeight = windowHeight;
+    }
+    ParseJsonInstances(json, g_app.pendingInstances);
+    for (const PersistedInstance& instance : g_app.pendingInstances) {
+        g_app.nextInstanceId = std::max(g_app.nextInstanceId, instance.id + 1);
     }
     return !json.empty();
 }
@@ -580,35 +767,97 @@ std::wstring ReadEditorText(HWND editor) {
     return content;
 }
 
+void CaptureWindowGeometry(WindowState* state);
+void SaveCurrentWindowState(HWND window);
+
 bool SaveSettings(const Settings& settings, std::wstring* errorMessage = nullptr) {
-    const std::wstring note = g_app.editor == nullptr
-                                  ? LoadNoteText()
-                                  : ReadEditorText(g_app.editor);
-    return SaveNoteaseFile(note, settings, errorMessage);
+    WindowState* mother = g_app.mother;
+    if (mother == nullptr) {
+        return false;
+    }
+
+    CaptureWindowGeometry(mother);
+    Settings savedSettings = settings;
+    savedSettings.windowPositionValid = mother->settings.windowPositionValid;
+    savedSettings.windowLeft = mother->settings.windowLeft;
+    savedSettings.windowTop = mother->settings.windowTop;
+    savedSettings.windowSizeValid = mother->settings.windowSizeValid;
+    savedSettings.windowWidth = mother->settings.windowWidth;
+    savedSettings.windowHeight = mother->settings.windowHeight;
+
+    std::vector<PersistedInstance> instances;
+    for (WindowState* state : g_app.windows) {
+        if (state == nullptr || state->mother || state->deleted) {
+            continue;
+        }
+        CaptureWindowGeometry(state);
+        PersistedInstance instance;
+        instance.id = state->instanceId;
+        instance.note = ReadEditorText(state->editor);
+        instance.settings = state->settings;
+        instances.push_back(std::move(instance));
+    }
+    return SaveNoteaseFile(ReadEditorText(mother->editor), savedSettings,
+                           instances, errorMessage);
 }
 
-bool SaveNoteText(HWND editor, const Settings& settings) {
-    if (editor == nullptr) return false;
-    return SaveNoteaseFile(ReadEditorText(editor), settings);
+bool SaveNoteText(WindowState* state) {
+    if (state == nullptr || state->editor == nullptr) {
+        return false;
+    }
+    SaveCurrentWindowState(state->window);
+    return true;
 }
 
-void CaptureWindowGeometry(HWND window) {
+void CaptureWindowGeometry(WindowState* state) {
+    if (state == nullptr || state->window == nullptr) {
+        return;
+    }
     RECT windowRectangle{};
-    if (!GetWindowRect(window, &windowRectangle)) {
+    if (!GetWindowRect(state->window, &windowRectangle)) {
         return;
     }
 
-    g_app.settings.windowPositionValid = true;
-    g_app.settings.windowLeft = windowRectangle.left;
-    g_app.settings.windowTop = windowRectangle.top;
-    g_app.settings.windowSizeValid = true;
-    g_app.settings.windowWidth = windowRectangle.right - windowRectangle.left;
-    g_app.settings.windowHeight = windowRectangle.bottom - windowRectangle.top;
+    state->settings.windowPositionValid = true;
+    state->settings.windowLeft = windowRectangle.left;
+    state->settings.windowTop = windowRectangle.top;
+    state->settings.windowSizeValid = true;
+    state->settings.windowWidth = windowRectangle.right - windowRectangle.left;
+    state->settings.windowHeight = windowRectangle.bottom - windowRectangle.top;
+}
+
+std::vector<PersistedInstance> SnapshotInstances() {
+    std::vector<PersistedInstance> instances;
+    for (WindowState* state : g_app.windows) {
+        if (state == nullptr || state->mother || state->deleted) {
+            continue;
+        }
+        PersistedInstance instance;
+        instance.id = state->instanceId;
+        instance.note = ReadEditorText(state->editor);
+        instance.settings = state->settings;
+        instances.push_back(std::move(instance));
+    }
+    return instances;
+}
+
+void SaveAllWindowStates() {
+    WindowState* mother = g_app.mother;
+    if (mother == nullptr) {
+        return;
+    }
+    for (WindowState* state : g_app.windows) {
+        if (state != nullptr && !state->deleted) {
+            CaptureWindowGeometry(state);
+        }
+    }
+    SaveNoteaseFile(ReadEditorText(mother->editor), mother->settings,
+                    SnapshotInstances());
 }
 
 void SaveCurrentWindowState(HWND window) {
-    CaptureWindowGeometry(window);
-    SaveNoteText(g_app.editor, g_app.settings);
+    CaptureWindowGeometry(GetWindowState(window));
+    SaveAllWindowStates();
 }
 
 void ApplyAlwaysOnTop(HWND window, bool alwaysOnTop) {
@@ -683,7 +932,8 @@ bool SetAutoStartEnabled(bool enabled, std::wstring* errorMessage = nullptr) {
 }
 
 void ShowError(const std::wstring& message) {
-    MessageBoxW(g_app.window, message.c_str(), L"Notease", MB_OK | MB_ICONWARNING);
+    MessageBoxW(g_app.mother == nullptr ? nullptr : g_app.mother->window,
+                message.c_str(), L"Notease", MB_OK | MB_ICONWARNING);
 }
 
 void SetWindowRegion(HWND window) {
@@ -704,30 +954,32 @@ void DisableDwmBorder(HWND window) {
 }
 
 void LayoutEditor(HWND window) {
-    if (g_app.editor == nullptr) {
+    WindowState* state = GetWindowState(window);
+    if (state == nullptr || state->editor == nullptr) {
         return;
     }
 
-    ShowWindow(g_app.editor, SW_SHOW);
+    ShowWindow(state->editor, SW_SHOW);
 
     RECT client{};
     GetClientRect(window, &client);
     const int padding = ScaleForDpi(3, window);
     const int top = ScaleForDpi(kTitleBarHeight, window) + padding;
-    MoveWindow(g_app.editor, padding, top, client.right - padding * 2,
+    MoveWindow(state->editor, padding, top, client.right - padding * 2,
                client.bottom - top - padding, TRUE);
 
     RECT editorClient{};
-    GetClientRect(g_app.editor, &editorClient);
+    GetClientRect(state->editor, &editorClient);
     const int textMargin = ScaleForDpi(8, window);
     RECT textRectangle{textMargin, 0, editorClient.right - textMargin,
                        editorClient.bottom};
-    SendMessageW(g_app.editor, EM_SETRECTNP, 0,
+    SendMessageW(state->editor, EM_SETRECTNP, 0,
                  reinterpret_cast<LPARAM>(&textRectangle));
 }
 
 void LayoutButtons(HWND window) {
-    if (g_app.collapseButton == nullptr || g_app.hideButton == nullptr) {
+    WindowState* state = GetWindowState(window);
+    if (state == nullptr) {
         return;
     }
 
@@ -740,10 +992,19 @@ void LayoutButtons(HWND window) {
     const int right = client.right - ScaleForDpi(8, window);
     const int top = ScaleForDpi(4, window);
 
-    MoveWindow(g_app.collapseButton, right - buttonWidth - gap - buttonWidth,
-               top, buttonWidth, buttonHeight, TRUE);
-    MoveWindow(g_app.hideButton, right - buttonWidth, top, buttonWidth,
-               buttonHeight, TRUE);
+    if (state->mother) {
+        MoveWindow(state->newButton,
+                   right - buttonWidth * 3 - gap * 2, top, buttonWidth,
+                   buttonHeight, TRUE);
+        MoveWindow(state->collapseButton,
+                   right - buttonWidth * 2 - gap, top, buttonWidth,
+                   buttonHeight, TRUE);
+        MoveWindow(state->hideButton, right - buttonWidth, top, buttonWidth,
+                   buttonHeight, TRUE);
+    } else {
+        MoveWindow(state->deleteButton, right - buttonWidth, top, buttonWidth,
+                   buttonHeight, TRUE);
+    }
 }
 
 void LayoutControls(HWND window) {
@@ -752,7 +1013,8 @@ void LayoutControls(HWND window) {
 }
 
 void UpdateEditorFont(HWND window) {
-    if (g_app.editor == nullptr) {
+    WindowState* state = GetWindowState(window);
+    if (state == nullptr || state->editor == nullptr) {
         return;
     }
 
@@ -764,16 +1026,15 @@ void UpdateEditorFont(HWND window) {
         return;
     }
 
-    HFONT previous = g_app.editorFont;
-    g_app.editorFont = font;
-    SendMessageW(g_app.editor, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    if (g_app.collapseButton != nullptr) {
-        SendMessageW(g_app.collapseButton, WM_SETFONT,
+    HFONT previous = state->editorFont;
+    state->editorFont = font;
+    SendMessageW(state->editor, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    for (HWND button : {state->newButton, state->collapseButton,
+                        state->hideButton, state->deleteButton}) {
+        if (button != nullptr) {
+            SendMessageW(button, WM_SETFONT,
                      reinterpret_cast<WPARAM>(font), TRUE);
-    }
-    if (g_app.hideButton != nullptr) {
-        SendMessageW(g_app.hideButton, WM_SETFONT,
-                     reinterpret_cast<WPARAM>(font), TRUE);
+        }
     }
     if (previous != nullptr) {
         DeleteObject(previous);
@@ -781,15 +1042,42 @@ void UpdateEditorFont(HWND window) {
 }
 
 void ShowNoteWindow(HWND window) {
+    WindowState* state = GetWindowState(window);
+    if (state == nullptr) {
+        return;
+    }
     ShowWindow(window, SW_SHOWNORMAL);
-    SetWindowPos(window, g_app.settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+    SetWindowPos(window, state->settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                  0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    if (state->mother) {
+        for (WindowState* child : g_app.windows) {
+            if (child != nullptr && !child->mother && !child->deleted) {
+                ShowWindow(child->window, SW_SHOWNORMAL);
+                SetWindowPos(child->window,
+                             child->settings.alwaysOnTop ? HWND_TOPMOST
+                                                         : HWND_NOTOPMOST,
+                             0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            }
+        }
+    }
     SetForegroundWindow(window);
 }
 
 void HideNoteWindow(HWND window) {
-    SaveNoteText(g_app.editor, g_app.settings);
+    WindowState* state = GetWindowState(window);
+    if (state == nullptr) {
+        return;
+    }
+    SaveCurrentWindowState(window);
+    if (state->mother) {
+        for (WindowState* child : g_app.windows) {
+            if (child != nullptr && !child->mother && !child->deleted) {
+                ShowWindow(child->window, SW_HIDE);
+            }
+        }
+    }
     ShowWindow(window, SW_HIDE);
 }
 
@@ -824,7 +1112,11 @@ void RemoveTrayIcon() {
 }
 
 void ToggleAutoStart() {
-    const bool previous = g_app.settings.autoStart;
+    WindowState* mother = g_app.mother;
+    if (mother == nullptr) {
+        return;
+    }
+    const bool previous = mother->settings.autoStart;
     const bool desired = !previous;
     std::wstring error;
     if (!SetAutoStartEnabled(desired, &error)) {
@@ -832,7 +1124,7 @@ void ToggleAutoStart() {
         return;
     }
 
-    Settings next = g_app.settings;
+    Settings next = mother->settings;
     next.autoStart = desired;
     if (!SaveSettings(next, &error)) {
         SetAutoStartEnabled(previous);
@@ -840,22 +1132,41 @@ void ToggleAutoStart() {
         return;
     }
 
-    g_app.settings = next;
+    mother->settings = next;
 }
 
 void ToggleAlwaysOnTop(HWND window) {
-    const bool previous = g_app.settings.alwaysOnTop;
-    Settings next = g_app.settings;
+    WindowState* mother = g_app.mother;
+    if (mother == nullptr) {
+        return;
+    }
+    const bool previous = mother->settings.alwaysOnTop;
+    Settings next = mother->settings;
     next.alwaysOnTop = !previous;
+    for (WindowState* state : g_app.windows) {
+        if (state != nullptr && !state->mother && !state->deleted) {
+            state->settings.alwaysOnTop = next.alwaysOnTop;
+        }
+    }
     std::wstring error;
     if (!SaveSettings(next, &error)) {
+        for (WindowState* state : g_app.windows) {
+            if (state != nullptr && !state->mother && !state->deleted) {
+                state->settings.alwaysOnTop = previous;
+            }
+        }
         ShowError(error);
         return;
     }
 
-    g_app.settings = next;
+    mother->settings = next;
     ApplyAlwaysOnTop(window, next.alwaysOnTop);
-    RedrawButton(g_app.collapseButton);
+    RedrawButton(mother->collapseButton);
+    for (WindowState* state : g_app.windows) {
+        if (state != nullptr && !state->mother && !state->deleted) {
+            ApplyAlwaysOnTop(state->window, next.alwaysOnTop);
+        }
+    }
 }
 
 void HandleTrayCommand(HWND window, UINT command) {
@@ -878,7 +1189,9 @@ void ShowTrayMenu(HWND window) {
     }
 
     const std::wstring autoStartText =
-        g_app.settings.autoStart ? L"自启动√" : L"自启动×";
+        (g_app.mother != nullptr && g_app.mother->settings.autoStart)
+            ? L"自启动√"
+            : L"自启动×";
     AppendMenuW(menu, MF_STRING, kTrayAutoStartCommand, autoStartText.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kTrayExitCommand, L"退出程序");
@@ -899,20 +1212,23 @@ void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
                  bool emphasized) {
     HDC deviceContext = item.hDC;
     RECT rectangle = item.rcItem;
+    WindowState* state = GetWindowState(GetParent(item.hwndItem));
     const COLORREF background = RGB(248, 222, 116);
     HBRUSH brush = CreateSolidBrush(background);
     FillRect(deviceContext, &rectangle, brush);
     DeleteObject(brush);
 
     const bool pinIcon = item.CtlID == kCollapseButtonId;
+    const bool plusIcon = item.CtlID == kNewButtonId;
+    const bool trashIcon = item.CtlID == kDeleteButtonId;
+    const bool symbolIcon = pinIcon || plusIcon || trashIcon;
     HFONT font = CreateFontW(
-        -ScaleForDpi(pinIcon ? 16 : 12, g_app.window), 0, 0, 0,
+        -ScaleForDpi(symbolIcon ? 16 : 12, item.hwndItem), 0, 0, 0,
         pinIcon ? FW_BOLD : (emphasized ? FW_SEMIBOLD : FW_NORMAL),
         FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        item.CtlID == kCollapseButtonId ? L"Segoe MDL2 Assets"
-                                        : L"Microsoft YaHei UI");
+        symbolIcon ? L"Segoe MDL2 Assets" : L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(deviceContext, font);
     SetBkMode(deviceContext, TRANSPARENT);
     SetTextColor(deviceContext, RGB(86, 67, 20));
@@ -921,7 +1237,9 @@ void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
         const int centerX = (textRectangle.left + textRectangle.right) / 2;
         const int centerY = (textRectangle.top + textRectangle.bottom) / 2;
         constexpr double diagonalAngle = 0.7853981633974483;
-        const double angle = g_app.settings.alwaysOnTop ? 0.0 : diagonalAngle;
+        const double angle = state != nullptr && state->settings.alwaysOnTop
+                                 ? 0.0
+                                 : diagonalAngle;
         const double sine = std::sin(angle);
         const double cosine = std::cos(angle);
         // Keep the custom shape at a stable visual size. The button itself
@@ -947,9 +1265,27 @@ void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
         Gdiplus::SolidBrush pinBrush(Gdiplus::Color(255, 86, 67, 20));
         graphics.FillPolygon(&pinBrush, pinShape, ARRAYSIZE(pinShape));
+    } else if (plusIcon) {
+        const int lineWidth = ScaleForDpi(14, item.hwndItem);
+        const int lineHeight = ScaleForDpi(2, item.hwndItem);
+        const int centerX = (textRectangle.left + textRectangle.right) / 2;
+        const int centerY = (textRectangle.top + textRectangle.bottom) / 2;
+        RECT lineRectangle{centerX - lineWidth / 2, centerY - lineHeight / 2,
+                           centerX + lineWidth / 2,
+                           centerY + (lineHeight + 1) / 2};
+        HBRUSH lineBrush = CreateSolidBrush(RGB(86, 67, 20));
+        FillRect(deviceContext, &lineRectangle, lineBrush);
+        RECT verticalRectangle{centerX - lineHeight / 2, centerY - lineWidth / 2,
+                               centerX + (lineHeight + 1) / 2,
+                               centerY + lineWidth / 2};
+        FillRect(deviceContext, &verticalRectangle, lineBrush);
+        DeleteObject(lineBrush);
+    } else if (trashIcon) {
+        DrawTextW(deviceContext, text.c_str(), -1, &textRectangle,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     } else if (emphasized) {
-        const int lineWidth = ScaleForDpi(14, g_app.window);
-        const int lineHeight = ScaleForDpi(2, g_app.window);
+        const int lineWidth = ScaleForDpi(14, item.hwndItem);
+        const int lineHeight = ScaleForDpi(2, item.hwndItem);
         const int centerX = (textRectangle.left + textRectangle.right) / 2;
         const int centerY = (textRectangle.top + textRectangle.bottom) / 2;
         RECT lineRectangle{centerX - lineWidth / 2, centerY - lineHeight / 2,
@@ -967,6 +1303,7 @@ void PaintButton(const DRAWITEMSTRUCT& item, const std::wstring& text,
 }
 
 void PaintWindow(HWND window, HDC deviceContext) {
+    WindowState* state = GetWindowState(window);
     RECT client{};
     GetClientRect(window, &client);
 
@@ -976,24 +1313,28 @@ void PaintWindow(HWND window, HDC deviceContext) {
 
     RECT titleRectangle = client;
     titleRectangle.bottom = ScaleForDpi(kTitleBarHeight, window);
-    HBRUSH titleBrush = CreateSolidBrush(RGB(248, 222, 116));
+    const COLORREF titleBackground = RGB(248, 222, 116);
+    HBRUSH titleBrush = CreateSolidBrush(titleBackground);
     FillRect(deviceContext, &titleRectangle, titleBrush);
     DeleteObject(titleBrush);
 
-    HFONT titleFont = CreateFontW(
-        -ScaleForDpi(14, window), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    HGDIOBJ oldFont = SelectObject(deviceContext, titleFont);
+    if (state == nullptr || state->mother) {
+        HFONT titleFont = CreateFontW(
+            -ScaleForDpi(14, window), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+            FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            L"Microsoft YaHei UI");
+        HGDIOBJ oldFont = SelectObject(deviceContext, titleFont);
 
-    SetBkMode(deviceContext, TRANSPARENT);
-    SetTextColor(deviceContext, RGB(77, 59, 16));
-    RECT titleText{ScaleForDpi(10, window), 0, titleRectangle.right,
-                   titleRectangle.bottom};
-    DrawTextW(deviceContext, L"Notease", -1, &titleText,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    SelectObject(deviceContext, oldFont);
-    DeleteObject(titleFont);
+        SetBkMode(deviceContext, TRANSPARENT);
+        SetTextColor(deviceContext, RGB(77, 59, 16));
+        RECT titleText{ScaleForDpi(10, window), 0, titleRectangle.right,
+                       titleRectangle.bottom};
+        DrawTextW(deviceContext, L"Notease", -1, &titleText,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(deviceContext, oldFont);
+        DeleteObject(titleFont);
+    }
 
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(211, 180, 65));
     HGDIOBJ oldPen = SelectObject(deviceContext, borderPen);
@@ -1006,18 +1347,37 @@ void PaintWindow(HWND window, HDC deviceContext) {
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
                             LPARAM lParam) {
+    WindowState* state = GetWindowState(window);
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        if (create == nullptr || create->lpCreateParams == nullptr) {
+            return FALSE;
+        }
+        state = reinterpret_cast<WindowState*>(create->lpCreateParams);
+        state->window = window;
+        state->registered = true;
+        SetWindowLongPtrW(window, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(state));
+        g_app.windows.push_back(state);
+        return TRUE;
+    }
+
     if (g_app.taskbarCreatedMessage != 0 &&
-        message == g_app.taskbarCreatedMessage) {
+        message == g_app.taskbarCreatedMessage && state != nullptr &&
+        state->mother) {
         AddTrayIcon(window);
         return 0;
     }
 
     switch (message) {
     case WM_CREATE: {
+        if (state == nullptr) {
+            return -1;
+        }
         // Setting the initial text sends EN_CHANGE. Ignore that notification
         // so startup cannot schedule a save before the editor is initialized.
-        g_app.loadingEditor = true;
-        g_app.editor = CreateWindowExW(
+        state->loadingEditor = true;
+        state->editor = CreateWindowExW(
             0, L"EDIT", nullptr,
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL |
                 ES_WANTRETURN,
@@ -1025,39 +1385,68 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditorControlId)),
             g_app.instance,
             nullptr);
-        if (g_app.editor == nullptr) {
+        if (state->editor == nullptr) {
             return -1;
         }
-        g_app.editorWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-            g_app.editor, GWLP_WNDPROC,
+        state->editorWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            state->editor, GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(EditorWindowProc)));
 
-        g_app.collapseButton = CreateWindowExW(
-            0, L"BUTTON", L"\xE841",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCollapseButtonId)),
-            g_app.instance, nullptr);
-        g_app.hideButton = CreateWindowExW(
-            0, L"BUTTON", L"一",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, window,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHideButtonId)),
-            g_app.instance, nullptr);
-        if (g_app.collapseButton == nullptr || g_app.hideButton == nullptr) {
-            return -1;
+        if (state->mother) {
+            state->newButton = CreateWindowExW(
+                0, L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNewButtonId)),
+                g_app.instance, nullptr);
+            state->collapseButton = CreateWindowExW(
+                0, L"BUTTON", L"\xE841",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCollapseButtonId)),
+                g_app.instance, nullptr);
+            state->hideButton = CreateWindowExW(
+                0, L"BUTTON", L"一", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kHideButtonId)),
+                g_app.instance, nullptr);
+            if (state->newButton == nullptr || state->collapseButton == nullptr ||
+                state->hideButton == nullptr) {
+                return -1;
+            }
+        } else {
+            state->deleteButton = CreateWindowExW(
+                0, L"BUTTON", L"\xE74D",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDeleteButtonId)),
+                g_app.instance, nullptr);
+            if (state->deleteButton == nullptr) {
+                return -1;
+            }
         }
-        g_app.collapseButtonWindowProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_app.collapseButton, GWLP_WNDPROC,
-                              reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
-        g_app.hideButtonWindowProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_app.hideButton, GWLP_WNDPROC,
-                              reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
-        SendMessageW(g_app.editor, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
+
+        for (HWND button : {state->newButton, state->collapseButton,
+                            state->hideButton, state->deleteButton}) {
+            if (button == nullptr) {
+                continue;
+            }
+            WNDPROC original = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                button, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(ButtonWindowProc)));
+            if (button == state->newButton) state->newButtonWindowProc = original;
+            if (button == state->collapseButton) {
+                state->collapseButtonWindowProc = original;
+            }
+            if (button == state->hideButton) state->hideButtonWindowProc = original;
+            if (button == state->deleteButton) {
+                state->deleteButtonWindowProc = original;
+            }
+        }
+        SendMessageW(state->editor, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
         UpdateEditorFont(window);
-        const std::wstring note = LoadNoteText();
-        SetWindowTextW(g_app.editor, note.c_str());
-        g_app.loadingEditor = false;
+        SetWindowTextW(state->editor, state->initialText.c_str());
+        state->initialText.clear();
+        state->loadingEditor = false;
         LayoutControls(window);
         SetWindowRegion(window);
         return 0;
@@ -1128,7 +1517,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
             }
             HWND child = ChildWindowFromPointEx(window, point,
                                                 CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
-            if (child == g_app.collapseButton || child == g_app.hideButton) {
+            if (child == state->newButton || child == state->collapseButton ||
+                child == state->hideButton || child == state->deleteButton) {
                 return HTCLIENT;
             }
             return HTCAPTION;
@@ -1151,31 +1541,82 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         if (GET_Y_LPARAM(lParam) < titleHeight &&
             GET_X_LPARAM(lParam) >= ScaleForDpi(10, window) &&
             GET_X_LPARAM(lParam) < titleClickWidth) {
-            SetWindowTextW(g_app.editor, L"");
-            SaveNoteText(g_app.editor, g_app.settings);
-            SetFocus(g_app.editor);
+            SetWindowTextW(state->editor, L"");
+            SaveNoteText(state);
+            SetFocus(state->editor);
             return 0;
         }
         break;
     }
 
     case WM_COMMAND:
-        if (reinterpret_cast<HWND>(lParam) == g_app.editor &&
+        if (reinterpret_cast<HWND>(lParam) == state->editor &&
             HIWORD(wParam) == EN_CHANGE) {
-            if (g_app.loadingEditor) {
+            if (state->loadingEditor) {
                 return 0;
             }
             SetTimer(window, kSaveTimer, 500, nullptr);
             return 0;
         }
         if (HIWORD(wParam) == BN_CLICKED &&
-            reinterpret_cast<HWND>(lParam) == g_app.collapseButton) {
+            reinterpret_cast<HWND>(lParam) == state->newButton) {
+            WindowState* newState = new WindowState;
+            newState->instance = g_app.instance;
+            newState->instanceId = g_app.nextInstanceId++;
+            newState->settings = g_app.mother->settings;
+            newState->settings.windowPositionValid = false;
+            newState->settings.windowSizeValid = false;
+            newState->initialText.clear();
+            RECT motherRectangle{};
+            GetWindowRect(window, &motherRectangle);
+            const int offset = ScaleForDpi(
+                24 * static_cast<int>(std::max<size_t>(1, g_app.windows.size())),
+                window);
+            const int width = ScaleForDpi(kNormalWidth, window);
+            const int height = ScaleForDpi(kNormalHeight, window);
+            newState->settings.windowPositionValid = true;
+            newState->settings.windowLeft = motherRectangle.left + offset;
+            newState->settings.windowTop = motherRectangle.top + offset;
+            newState->settings.windowSizeValid = true;
+            newState->settings.windowWidth = width;
+            newState->settings.windowHeight = height;
+
+            HWND newWindow = CreateWindowExW(
+                WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
+                WS_POPUP | WS_THICKFRAME, newState->settings.windowLeft,
+                newState->settings.windowTop, width, height, nullptr, nullptr,
+                g_app.instance, newState);
+            if (newWindow == nullptr) {
+                if (!newState->registered) {
+                    delete newState;
+                }
+                ShowError(L"无法创建新的便签实例。");
+                return 0;
+            }
+            DisableDwmBorder(newWindow);
+            ApplyAlwaysOnTop(newWindow, newState->settings.alwaysOnTop);
+            ShowWindow(newWindow, SW_SHOWNORMAL);
+            UpdateWindow(newWindow);
+            SetForegroundWindow(newWindow);
+            SaveAllWindowStates();
+            return 0;
+        }
+        if (HIWORD(wParam) == BN_CLICKED &&
+            reinterpret_cast<HWND>(lParam) == state->collapseButton) {
             PostMessageW(window, kToggleAlwaysOnTopMessage, 0, 0);
             return 0;
         }
         if (HIWORD(wParam) == BN_CLICKED &&
-            reinterpret_cast<HWND>(lParam) == g_app.hideButton) {
+            reinterpret_cast<HWND>(lParam) == state->hideButton) {
             HideNoteWindow(window);
+            return 0;
+        }
+        if (HIWORD(wParam) == BN_CLICKED &&
+            reinterpret_cast<HWND>(lParam) == state->deleteButton) {
+            state->deleted = true;
+            KillTimer(window, kSaveTimer);
+            SaveAllWindowStates();
+            DestroyWindow(window);
             return 0;
         }
         if (LOWORD(wParam) == kTrayAutoStartCommand ||
@@ -1201,7 +1642,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
     case WM_TIMER:
         if (wParam == kSaveTimer) {
             KillTimer(window, kSaveTimer);
-            SaveNoteText(g_app.editor, g_app.settings);
+            SaveCurrentWindowState(window);
             return 0;
         }
         break;
@@ -1219,12 +1660,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         if (item == nullptr || item->CtlType != ODT_BUTTON) {
             break;
         }
+        if (item->CtlID == kNewButtonId) {
+            PaintButton(*item, L"+", false);
+            return TRUE;
+        }
         if (item->CtlID == kCollapseButtonId) {
             PaintButton(*item, L"\xE841", false);
             return TRUE;
         }
         if (item->CtlID == kHideButtonId) {
             PaintButton(*item, L"一", true);
+            return TRUE;
+        }
+        if (item->CtlID == kDeleteButtonId) {
+            PaintButton(*item, L"\xE74D", false);
             return TRUE;
         }
         break;
@@ -1264,26 +1713,58 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam,
         return 1;
 
     case WM_CLOSE: {
-        // Save before destroying the parent window. During DestroyWindow,
-        // the child editor may already be gone by the time WM_DESTROY runs.
         KillTimer(window, kSaveTimer);
-        SaveCurrentWindowState(window);
+        if (state != nullptr && state->mother) {
+            SaveAllWindowStates();
+            std::vector<HWND> childWindows;
+            for (WindowState* child : g_app.windows) {
+                if (child != nullptr && !child->mother &&
+                    child->window != nullptr) {
+                    childWindows.push_back(child->window);
+                }
+            }
+            for (HWND child : childWindows) {
+                DestroyWindow(child);
+            }
+        } else {
+            SaveCurrentWindowState(window);
+        }
         DestroyWindow(window);
         return 0;
     }
 
     case WM_DESTROY:
-        RemoveTrayIcon();
-        if (g_app.editorFont != nullptr) {
-            DeleteObject(g_app.editorFont);
-            g_app.editorFont = nullptr;
+        if (state != nullptr && state->mother) {
+            RemoveTrayIcon();
+            if (g_app.mutex != nullptr) {
+                CloseHandle(g_app.mutex);
+                g_app.mutex = nullptr;
+            }
+            PostQuitMessage(0);
         }
-        if (g_app.mutex != nullptr) {
-            CloseHandle(g_app.mutex);
-            g_app.mutex = nullptr;
-        }
-        PostQuitMessage(0);
         return 0;
+
+    case WM_NCDESTROY: {
+        if (state != nullptr) {
+            auto iterator = std::find(g_app.windows.begin(), g_app.windows.end(),
+                                      state);
+            if (iterator != g_app.windows.end()) {
+                g_app.windows.erase(iterator);
+            }
+            if (state->editorFont != nullptr) {
+                DeleteObject(state->editorFont);
+                state->editorFont = nullptr;
+            }
+            if (state->mother) {
+                g_app.mother = nullptr;
+            }
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            if (!state->mother) {
+                delete state;
+            }
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
 
     default:
         return DefWindowProcW(window, message, wParam, lParam);
@@ -1324,7 +1805,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     Settings settings;
     LoadSettings(settings);
-    g_app.settings = settings;
+    g_mother = WindowState{};
+    g_mother.instance = instance;
+    g_mother.mother = true;
+    g_mother.settings = settings;
+    g_mother.initialText = LoadNoteText();
+    g_app.mother = &g_mother;
 
     std::wstring startupWarning;
     if (!SetAutoStartEnabled(settings.autoStart, &startupWarning)) {
@@ -1382,14 +1868,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     HWND window = CreateWindowExW(
         WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
         WS_POPUP | WS_THICKFRAME, left, top, width, height, nullptr, nullptr,
-        instance, nullptr);
+        instance, &g_mother);
     if (window == nullptr) {
         UnregisterClassW(kWindowClassName, instance);
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         CloseHandle(mutex);
         return 1;
     }
-    g_app.window = window;
     DisableDwmBorder(window);
     ApplyAlwaysOnTop(window, settings.alwaysOnTop);
 
@@ -1400,6 +1885,46 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     ShowWindow(window, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
     UpdateWindow(window);
+
+    for (const PersistedInstance& persisted : g_app.pendingInstances) {
+        WindowState* child = new WindowState;
+        child->instance = g_app.instance;
+        child->mother = false;
+        child->instanceId = persisted.id;
+        child->settings = persisted.settings;
+        child->settings.alwaysOnTop = settings.alwaysOnTop;
+        child->initialText = persisted.note;
+        if (!child->settings.windowPositionValid) {
+            child->settings.windowPositionValid = true;
+            child->settings.windowLeft = left +
+                ScaleForDpi(24 * static_cast<int>(g_app.windows.size()), window);
+            child->settings.windowTop = top +
+                ScaleForDpi(24 * static_cast<int>(g_app.windows.size()), window);
+        }
+        if (!child->settings.windowSizeValid) {
+            child->settings.windowSizeValid = true;
+            child->settings.windowWidth = width;
+            child->settings.windowHeight = height;
+        }
+        HWND childWindow = CreateWindowExW(
+            WS_EX_TOOLWINDOW, kWindowClassName, kWindowTitle,
+            WS_POPUP | WS_THICKFRAME, child->settings.windowLeft,
+            child->settings.windowTop, child->settings.windowWidth,
+            child->settings.windowHeight, nullptr, nullptr, g_app.instance,
+            child);
+        if (childWindow == nullptr) {
+            if (!child->registered) {
+                delete child;
+            }
+            continue;
+        }
+        DisableDwmBorder(childWindow);
+        ApplyAlwaysOnTop(childWindow, child->settings.alwaysOnTop);
+        ShowWindow(childWindow, SW_SHOWNORMAL);
+        UpdateWindow(childWindow);
+    }
+    g_app.pendingInstances.clear();
+    SaveAllWindowStates();
 
     if (!startupWarning.empty()) {
         ShowError(startupWarning);
