@@ -1050,19 +1050,22 @@ void ShowNoteWindow(HWND window) {
     SetWindowPos(window, state->settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                  0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    // Activate the mother window before restoring child windows. Activating it
+    // after the children would move it above them in non-topmost mode.
+    SetForegroundWindow(window);
     if (state->mother) {
         for (WindowState* child : g_app.windows) {
             if (child != nullptr && !child->mother && !child->deleted) {
-                ShowWindow(child->window, SW_SHOWNORMAL);
+                ShowWindow(child->window, SW_SHOWNOACTIVATE);
                 SetWindowPos(child->window,
                              child->settings.alwaysOnTop ? HWND_TOPMOST
                                                          : HWND_NOTOPMOST,
                              0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW |
+                                 SWP_NOACTIVATE);
             }
         }
     }
-    SetForegroundWindow(window);
 }
 
 void HideNoteWindow(HWND window) {
